@@ -165,7 +165,7 @@ class ModelPersistence:
         if any_success:
             logger.info("✅ AI引擎至少有一个模型加载成功")
         else:
-            logger.info("⚠️ AI引擎没有加载任何模型，将重新训练")
+            logger.info("AI引擎暂无已训练权重；如需训练，请勾选“训练模型”后开始分析")
         return any_success
 
     # ---------- InterpretableXGBV18 双模型持久化 ----------

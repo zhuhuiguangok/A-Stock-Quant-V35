@@ -18,6 +18,7 @@ joblib>=1.3.0
 # ============= 深度学习 (PyTorch) =============
 torch>=2.0.0
 torchvision
+torch-geometric
 # 注意: torch-geometric 及其依赖项建议通过 conda 安装或从官方轮子安装
 # torch-geometric
 # torch-scatter
@@ -36,6 +37,7 @@ transformers>=4.30.0
 sentencepiece
 ftfy
 jieba
+stock-stil
 
 # ============= Web 框架 =============
 django>=4.2,<5.1
@@ -46,4 +48,5 @@ shap
 matplotlib
 python-dotenv
 baostock
+cvxpy
 

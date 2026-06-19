@@ -28,9 +28,8 @@ import sys
 # 【关键】必须在 import transformers / huggingface_hub 之前设置镜像环境变量
 # transformers 在 import 时就读取 HF_ENDPOINT，晚设置无效
 # ══════════════════════════════════════════════════════════════════════════════
-_HF_MIRROR = 'https://hf-mirror.com'
-if 'HF_ENDPOINT' not in os.environ:
-    os.environ['HF_ENDPOINT'] = _HF_MIRROR
+_HF_ENDPOINT = os.environ.get('HF_ENDPOINT', 'https://hf-mirror.com')
+os.environ['HF_ENDPOINT'] = _HF_ENDPOINT
 
 import numpy as np
 import pandas as pd
@@ -76,7 +75,7 @@ try:
     STOCK_STIL_AVAILABLE = True
 except ImportError:
     STOCK_STIL_AVAILABLE = False
-    logger.warning("⚠️ stock-stil未安装，请执行 pip install stock-stil")
+    logger.info("stock-stil 未启用，股吧数据将使用内置降级源")
     try:
         import bs4
         import lxml
