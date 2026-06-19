@@ -189,6 +189,11 @@
         .loader-steps { text-align:center; }
         .loader-title { font-size:18px; font-weight:600; color:var(--teal); margin-bottom:8px; }
         .loader-step  { font-size:13px; color:var(--text3); }
+        .analysis-progress { width:min(560px,80vw); margin-top:16px; }
+        .analysis-progress-track { height:8px; background:var(--bg3); border:1px solid var(--border2); border-radius:999px; overflow:hidden; }
+        .analysis-progress-bar { height:100%; width:0; background:linear-gradient(90deg,var(--teal2),var(--teal)); transition:width .35s ease; }
+        .analysis-progress-meta { display:flex; justify-content:space-between; margin-top:8px; font-family:var(--mono); font-size:12px; color:var(--text3); }
+        .analysis-progress-detail { min-height:18px; margin-top:8px; font-size:12px; color:var(--text2); }
 
         /* 市场状态卡 */
         .regime-card {
@@ -907,10 +912,20 @@
     <!-- 加载动画 -->
     <div class="loader" id="loader">
         <div class="loader-ring"></div>
-        <div class="loader-steps">
-            <div class="loader-title" id="loaderTitle">AI深度分析中...</div>
-            <div class="loader-step" id="loaderStep">正在拉取Tushare全量数据</div>
-        </div>
+            <div class="loader-steps">
+                <div class="loader-title" id="loaderTitle">AI深度分析中...</div>
+                <div class="loader-step" id="loaderStep">正在拉取Tushare全量数据</div>
+                <div class="analysis-progress">
+                    <div class="analysis-progress-track">
+                        <div class="analysis-progress-bar" id="analysisProgressBar"></div>
+                    </div>
+                    <div class="analysis-progress-meta">
+                        <span id="analysisProgressPercent">0%</span>
+                        <span id="analysisProgressElapsed">0.0s</span>
+                    </div>
+                    <div class="analysis-progress-detail" id="analysisProgressDetail">等待任务启动</div>
+                </div>
+            </div>
     </div>
 
     <!-- 模型状态条 -->
@@ -1170,20 +1185,6 @@
     /* ═══════════════════════════════  CONFIG ═══════════════════════════════ */
     const API_BASE = '/api';
     let currentData = null;
-    let loaderSteps = [
-        '正在拉取Tushare全量数据...',
-        '获取资金流/北向/质押/财务数据...',
-        '计算150+规则因子（KDJ/RSI/MACD/布林）...',
-        '运行涨势股模型（TreeModels）...',
-        '运行抄底股模型（底部筛选）...',
-        'AI引擎预测（MLP/Transformer/SmartXGNN）...',
-        'IC动态权重优化（Purged CV）...',
-        '风险中性化（行业+风格）...',
-        '组合优化（风险平价）...',
-        '整合结果...'
-    ];
-    let loaderIdx = 0, loaderTimer;
-
     /* ═══ 时钟 ═══ */
     function tick() {
         const n = new Date();
@@ -1208,22 +1209,44 @@
 
     /* ═══ Loader 动画 ═══ */
     function startLoader() {
-        loaderIdx = 0;
         document.getElementById('loader').classList.add('show');
         document.getElementById('emptyState').style.display = 'none';
-        document.getElementById('loaderTitle').textContent = 'V35引擎启动中...';
-        document.getElementById('loaderStep').textContent = loaderSteps[0];
-        loaderTimer = setInterval(() => {
-            loaderIdx = (loaderIdx + 1) % loaderSteps.length;
-            document.getElementById('loaderStep').textContent = loaderSteps[loaderIdx];
-            if (loaderIdx === 0) {
-                document.getElementById('loaderTitle').textContent = '持续分析中...';
-            }
-        }, 2800);
+        updateAnalysisProgress({
+            percent: 0, message: '正在创建分析任务',
+            stage: 'queued', detail: '等待后端接收', elapsed_seconds: 0
+        });
     }
     function stopLoader() {
-        clearInterval(loaderTimer);
         document.getElementById('loader').classList.remove('show');
+    }
+    function updateAnalysisProgress(progress) {
+        const percent = Math.max(0, Math.min(100, Number(progress.percent || 0)));
+        document.getElementById('loaderTitle').textContent =
+            progress.state === 'failed' ? '分析失败' : '真实分析进度';
+        document.getElementById('loaderStep').textContent = progress.message || '处理中...';
+        document.getElementById('analysisProgressBar').style.width = `${percent}%`;
+        document.getElementById('analysisProgressPercent').textContent = `${percent}%`;
+        document.getElementById('analysisProgressElapsed').textContent =
+            `${Number(progress.elapsed_seconds || 0).toFixed(1)}s`;
+        document.getElementById('analysisProgressDetail').textContent =
+            progress.detail || `当前阶段：${progress.stage || 'unknown'}`;
+    }
+    function sleep(ms) { return new Promise(resolve => setTimeout(resolve, ms)); }
+    async function waitForAnalysisTask(taskId) {
+        while (true) {
+            const response = await fetch(
+                `${API_BASE}/select/progress/?task_id=${encodeURIComponent(taskId)}`,
+                {cache: 'no-store'}
+            );
+            const progress = await response.json();
+            if (!response.ok) throw new Error(progress.message || '进度查询失败');
+            updateAnalysisProgress(progress);
+            if (progress.state === 'completed') return progress.result;
+            if (progress.state === 'failed') {
+                throw new Error((progress.result && progress.result.message) || progress.detail || '分析失败');
+            }
+            await sleep(1000);
+        }
     }
 
     /* ═══ 保存 Token ═══ */
@@ -1333,12 +1356,16 @@
                 exclude_chinext: document.getElementById('excludeChiNext').checked,
                 exclude_star: document.getElementById('excludeStar').checked,
             };
-            const res = await fetch(`${API_BASE}/select/`, {
+            const res = await fetch(`${API_BASE}/select/start/`, {
                 method: 'POST',
                 headers: {'Content-Type':'application/json'},
                 body: JSON.stringify(body)
             });
-            const data = await res.json();
+            const accepted = await res.json();
+            if (!res.ok || !accepted.task_id) {
+                throw new Error(accepted.message || '无法创建分析任务');
+            }
+            const data = await waitForAnalysisTask(accepted.task_id);
             const elapsed = ((Date.now() - t0)/1000).toFixed(1);
 
             if (data.status === 'success') {

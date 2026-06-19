@@ -25,6 +25,8 @@ import json
 import os
 import warnings
 import traceback
+import threading
+import uuid
 import concurrent.futures
 try:
     import baostock as bs
@@ -101,6 +103,38 @@ logging.basicConfig(
     ]
 )
 logger = logging.getLogger(__name__)
+
+_analysis_tasks = {}
+_analysis_tasks_lock = threading.Lock()
+_analysis_progress = threading.local()
+
+
+def _report_analysis_progress(stage, percent, message, detail=''):
+    task_id = getattr(_analysis_progress, 'task_id', None)
+    if not task_id:
+        return
+    with _analysis_tasks_lock:
+        task = _analysis_tasks.get(task_id)
+        if task is not None:
+            task.update({
+                'stage': stage,
+                'percent': max(0, min(100, int(percent))),
+                'message': message,
+                'detail': detail,
+                'updated_at': time.time(),
+            })
+
+
+def _analysis_task_snapshot(task_id):
+    with _analysis_tasks_lock:
+        task = _analysis_tasks.get(task_id)
+        if task is None:
+            return None
+        snapshot = dict(task)
+    snapshot['elapsed_seconds'] = round(
+        (snapshot.get('finished_at') or time.time()) - snapshot['started_at'], 1
+    )
+    return snapshot
 
 
 # ==================== 全局API简单令牌桶（保护积分）====================
@@ -636,6 +670,7 @@ class V19EnhancedEngine:
         # ====================== 1. XGBoost V18 ======================
         if USE_XGBOOST and self.xgb_model and hasattr(self.xgb_model, 'fit'):
             try:
+                _report_analysis_progress('training_xgboost', 62, '正在训练 XGBoost 模型', '')
                 logger.info("  🤖 训练XGBoost V18...")
                 val_size = max(50, int(len(X_arr) * 0.15))
                 X_tr, X_va = X_arr[:-val_size], X_arr[-val_size:]
@@ -656,6 +691,7 @@ class V19EnhancedEngine:
         # ====================== 2. AI引擎 ======================
         if USE_AI_MODELS and self.ai_engine:
             try:
+                _report_analysis_progress('training_ai', 68, '正在训练 AI 集成模型', 'MLP / Transformer / SmartXGNN')
                 logger.info("  🧠 训练AI引擎...")
                 if len(X_df) < 500:
                     logger.warning("  AI引擎样本不足，跳过训练")
@@ -702,6 +738,7 @@ class V19EnhancedEngine:
         if TREE_MODELS_AVAILABLE and self.trend_model and self.bottom_model:
             # 涨势股模型
             try:
+                _report_analysis_progress('training_trend', 74, '正在训练涨势股模型', '')
                 logger.info("  📈 训练涨势股模型（trend_model）...")
                 dates = pd.to_datetime(df_clean.get('trade_date')) if 'trade_date' in df_clean.columns else None
                 val_size = max(50, int(len(X_df_frame) * 0.15))
@@ -719,6 +756,7 @@ class V19EnhancedEngine:
 
             # 抄底股模型
             try:
+                _report_analysis_progress('training_bottom', 78, '正在训练抄底股模型', '')
                 logger.info("  📉 训练抄底股模型（bottom_model）...")
                 bottom_mask = pd.Series(False, index=range(len(df_clean)))
                 if 'price_position_60d' in df_clean.columns:
@@ -1776,6 +1814,7 @@ def get_real_stock_data(start_date: str = None, end_date: str = None,
     获取真实Tushare数据（私募级全量接口）
     包含：日线/基本面/资金流/涨跌停/北向/质押/财务/业绩预告
     """
+    _report_analysis_progress('trade_date', 12, '正在确定最新交易日', '')
     if end_date is None:
         logger.info(f"  [1/6] 获取最新交易日...")
         end_date = get_latest_trading_date()
@@ -1803,7 +1842,9 @@ def get_real_stock_data(start_date: str = None, end_date: str = None,
         if end_date < datetime.now().strftime('%Y%m%d') or (time.time() - file_mtime) < 7200:
             logger.info(f"✅ 从本地缓存加载数据: {cache_file}")
             try:
-                return pd.read_parquet(cache_file)
+                cached_df = pd.read_parquet(cache_file)
+                _report_analysis_progress('cache_loaded', 48, '已读取本地数据缓存', f'{len(cached_df)} 行数据')
+                return cached_df
             except Exception as e:
                 logger.warning(f"⚠️ 读取缓存失败: {e}，将重新获取数据")
 
@@ -1813,6 +1854,7 @@ def get_real_stock_data(start_date: str = None, end_date: str = None,
     api_governor.reset()  # 重置积分计数
 
     # ---- Step 1: 获取股票池 ----
+    _report_analysis_progress('stock_pool', 18, '正在获取股票池', stock_pool)
     try:
         if stock_pool == 'csi1000':
             stocks = pro.index_weight(index_code='000852.CSI')
@@ -1845,6 +1887,10 @@ def get_real_stock_data(start_date: str = None, end_date: str = None,
             f"  股票池: {len(unfiltered_codes)} 只 -> 过滤后 {len(ts_codes_all)} 只 "
             f"(排除 {len(unfiltered_codes) - len(ts_codes_all)} 只)"
         )
+        _report_analysis_progress(
+            'board_filter', 24, '板块过滤完成',
+            f'{len(unfiltered_codes)} 只 → {len(ts_codes_all)} 只',
+        )
         if not ts_codes_all:
             logger.error("板块过滤后股票池为空")
             return pd.DataFrame()
@@ -1853,6 +1899,7 @@ def get_real_stock_data(start_date: str = None, end_date: str = None,
         return pd.DataFrame()
 
     # ---- Step 2: 批量获取日线 + 基本面（行业标准方案）----
+    _report_analysis_progress('market_data', 30, '正在获取行情与基本面数据', f'目标股票 {len(ts_codes_all)} 只')
     all_data: List[pd.DataFrame] = []
     _BASIC_FIELDS = 'ts_code,trade_date,turnover_rate,volume_ratio,pe,pb,ps,total_mv,circ_mv'
 
@@ -2452,6 +2499,7 @@ def _make_json_serializable(obj):
 def dual_verify_stocks(request):
     """主选股接口（趋势 + 抄底分列返回）"""
     try:
+        _report_analysis_progress('request', 3, '分析任务已启动', '正在解析选股参数')
         body = json.loads(request.body) if request.body else {}
         max_stocks = body.get('max_stocks', 60)
         default_pool = DATA_SOURCE_CONFIG.get('stock_pool', 'csi1000')
@@ -2467,6 +2515,7 @@ def dual_verify_stocks(request):
             f"train={body.get('train', False)} ==="
         )
 
+        _report_analysis_progress('data_prepare', 10, '正在准备股票数据', f'股票池: {pool}')
         df = get_real_stock_data(
             start_date=None, end_date=None,
             stock_pool=pool,
@@ -2477,11 +2526,22 @@ def dual_verify_stocks(request):
         if df is None or df.empty:
             return JsonResponse({'status': 'error', 'message': '数据获取失败，请检查Tushare Token和网络'})
 
+        _report_analysis_progress('data_ready', 50, '股票数据准备完成', f'{len(df)} 行数据')
         logger.info(f"数据获取成功: {len(df)} 行, 列: {[c for c in ['ts_code','name','industry','close','total_mv','pe','pb'] if c in df.columns]}")
 
         if body.get('train', False):
-            v19_enhanced_engine.train_all_models(df)
+            _report_analysis_progress('training', 55, '已开始模型训练', f'训练样本 {len(df)} 行')
+            trained = v19_enhanced_engine.train_all_models(df)
+            _report_analysis_progress(
+                'training_done' if trained else 'training_skipped',
+                82,
+                '模型训练完成' if trained else '模型训练已跳过或未成功',
+                '继续执行选股预测',
+            )
+        else:
+            _report_analysis_progress('training_skipped', 58, '未启用模型训练', '使用已有模型或规则因子')
 
+        _report_analysis_progress('selection', 86, '正在计算因子并执行模型预测', '')
         selected = enhance_stock_selection_v19(df, top_n=max_stocks)
 
         # ══════════════════════════════════════════════════════════════
@@ -2495,6 +2555,7 @@ def dual_verify_stocks(request):
         if selected is None or selected.empty:
             return JsonResponse({'status': 'error', 'message': '选股结果为空'})
 
+        _report_analysis_progress('ranking', 94, '正在整理选股结果', f'候选股票 {len(selected)} 只')
         logger.info(f"选股完成: {len(selected)} 只，分数字段: neutral_score存在={('neutral_score' in selected.columns)}")
         logger.info(f"DEBUG pledge非零: {(selected['pledge_ratio']>0).sum()}, neg_ratio非零: {(selected['negative_ratio']>0).sum()}")
 
@@ -3095,6 +3156,82 @@ def dual_verify_stocks(request):
     except Exception as e:
         logger.error(f"选股接口异常: {e}\n{traceback.format_exc()}")
         return JsonResponse({'status': 'error', 'message': str(e)})
+
+
+def _run_analysis_task(task_id, raw_body):
+    from django.test import RequestFactory
+
+    _analysis_progress.task_id = task_id
+    with _analysis_tasks_lock:
+        _analysis_tasks[task_id]['state'] = 'running'
+    try:
+        request = RequestFactory().post(
+            '/api/select/', data=raw_body, content_type='application/json'
+        )
+        response = dual_verify_stocks(request)
+        result = json.loads(response.content.decode('utf-8'))
+        success = result.get('status') == 'success'
+        with _analysis_tasks_lock:
+            _analysis_tasks[task_id].update({
+                'state': 'completed' if success else 'failed',
+                'stage': 'completed' if success else 'failed',
+                'percent': 100,
+                'message': '选股分析完成' if success else '选股分析失败',
+                'detail': '' if success else result.get('message', '未知错误'),
+                'result': result,
+                'finished_at': time.time(),
+            })
+    except Exception as exc:
+        logger.error(f"后台选股任务异常: {exc}\n{traceback.format_exc()}")
+        with _analysis_tasks_lock:
+            _analysis_tasks[task_id].update({
+                'state': 'failed',
+                'stage': 'failed',
+                'percent': 100,
+                'message': '选股分析失败',
+                'detail': str(exc),
+                'result': {'status': 'error', 'message': str(exc)},
+                'finished_at': time.time(),
+            })
+    finally:
+        _analysis_progress.task_id = None
+
+
+@csrf_exempt
+def start_analysis_task(request):
+    if request.method != 'POST':
+        return JsonResponse({'status': 'error', 'message': '仅支持 POST'}, status=405)
+    raw_body = request.body or b'{}'
+    try:
+        json.loads(raw_body)
+    except (TypeError, ValueError):
+        return JsonResponse({'status': 'error', 'message': '请求 JSON 无效'}, status=400)
+
+    task_id = uuid.uuid4().hex
+    now = time.time()
+    with _analysis_tasks_lock:
+        _analysis_tasks[task_id] = {
+            'task_id': task_id, 'state': 'queued', 'stage': 'queued',
+            'percent': 0, 'message': '任务已进入队列', 'detail': '',
+            'started_at': now, 'updated_at': now, 'finished_at': None,
+            'result': None,
+        }
+    threading.Thread(
+        target=_run_analysis_task,
+        args=(task_id, raw_body),
+        daemon=True,
+        name=f'analysis-{task_id[:8]}',
+    ).start()
+    return JsonResponse({'status': 'accepted', 'task_id': task_id}, status=202)
+
+
+def analysis_task_progress(request):
+    snapshot = _analysis_task_snapshot(request.GET.get('task_id', '').strip())
+    if snapshot is None:
+        return JsonResponse(
+            {'status': 'error', 'message': '任务不存在或服务已重启'}, status=404
+        )
+    return JsonResponse(_make_json_serializable(snapshot))
 
 
 @csrf_exempt
