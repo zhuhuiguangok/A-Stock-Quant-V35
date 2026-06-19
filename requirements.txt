@@ -35,6 +35,7 @@ pyarrow
 transformers>=4.30.0
 sentencepiece
 ftfy
+jieba
 
 # ============= Web 框架 =============
 django>=4.2,<5.1
