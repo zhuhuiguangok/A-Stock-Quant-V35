@@ -878,6 +878,18 @@
                 训练模型
             </label>
         </div>
+        <div class="ctrl-group">
+            <label style="display:flex;align-items:center;gap:6px;font-size:13px;color:var(--text2);cursor:pointer">
+                <input type="checkbox" id="excludeChiNext" checked style="accent-color:var(--teal)">
+                排除创业板
+            </label>
+        </div>
+        <div class="ctrl-group">
+            <label style="display:flex;align-items:center;gap:6px;font-size:13px;color:var(--text2);cursor:pointer">
+                <input type="checkbox" id="excludeStar" checked style="accent-color:var(--teal)">
+                排除科创板
+            </label>
+        </div>
         <button class="btn-train" onclick="checkConnection()">
             <i class="fas fa-sync-alt"></i> 检测连接
         </button>
@@ -1318,6 +1330,8 @@
                 min_score:  parseInt(document.getElementById('minScore').value),
                 stock_pool: document.getElementById('stockPool').value,
                 train:      document.getElementById('trainCheck').checked,
+                exclude_chinext: document.getElementById('excludeChiNext').checked,
+                exclude_star: document.getElementById('excludeStar').checked,
             };
             const res = await fetch(`${API_BASE}/select/`, {
                 method: 'POST',

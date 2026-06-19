@@ -1755,8 +1755,23 @@ def enhance_stock_selection_v19(stock_df: pd.DataFrame, top_n: int = 100) -> pd.
 
 
 # ==================== 真实数据获取（全量接口）====================
+def _filter_stock_codes(ts_codes, exclude_chinext=True, exclude_star=True):
+    """按板块过滤股票代码，并保持原有顺序。"""
+    filtered = []
+    for ts_code in ts_codes:
+        code = str(ts_code).split('.', 1)[0]
+        if exclude_chinext and code.startswith(('300', '301')):
+            continue
+        if exclude_star and code.startswith(('688', '689')):
+            continue
+        filtered.append(ts_code)
+    return filtered
+
+
 def get_real_stock_data(start_date: str = None, end_date: str = None,
-                         stock_pool: str = 'csi1000', lookback_months: int = 12) -> pd.DataFrame:
+                         stock_pool: str = 'csi1000', lookback_months: int = 12,
+                         exclude_chinext: bool = True,
+                         exclude_star: bool = True) -> pd.DataFrame:
     """
     获取真实Tushare数据（私募级全量接口）
     包含：日线/基本面/资金流/涨跌停/北向/质押/财务/业绩预告
@@ -1768,12 +1783,19 @@ def get_real_stock_data(start_date: str = None, end_date: str = None,
         start_date = (datetime.strptime(end_date, '%Y%m%d') -
                       timedelta(days=lookback_months * 30)).strftime('%Y%m%d')
 
-    logger.info(f"[2/6] 获取全量数据: {stock_pool} | {start_date}~{end_date}")
+    logger.info(
+        f"[2/6] 获取全量数据: {stock_pool} | {start_date}~{end_date} | "
+        f"排除创业板={exclude_chinext} | 排除科创板={exclude_star}"
+    )
     
     # ── 数据缓存机制 (Grok 优化) ──
     cache_dir = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), 'data_cache')
     os.makedirs(cache_dir, exist_ok=True)
-    cache_file = os.path.join(cache_dir, f"real_data_{stock_pool}_{start_date}_{end_date}.parquet")
+    cache_file = os.path.join(
+        cache_dir,
+        f"real_data_{stock_pool}_cyb{int(exclude_chinext)}_"
+        f"star{int(exclude_star)}_{start_date}_{end_date}.parquet"
+    )
     
     if os.path.exists(cache_file):
         # 缓存有效期：如果 end_date 是今天，缓存有效期 2 小时；否则无限期
@@ -1813,8 +1835,19 @@ def get_real_stock_data(start_date: str = None, end_date: str = None,
         # 确保 ts_code 列存在
         if 'con_code' in stocks.columns and 'ts_code' not in stocks.columns:
             stocks = stocks.rename(columns={'con_code': 'ts_code'})
-        ts_codes_all = stocks['ts_code'].unique().tolist()
-        logger.info(f"  股票池: {len(ts_codes_all)} 只")
+        unfiltered_codes = stocks['ts_code'].unique().tolist()
+        ts_codes_all = _filter_stock_codes(
+            unfiltered_codes,
+            exclude_chinext=exclude_chinext,
+            exclude_star=exclude_star,
+        )
+        logger.info(
+            f"  股票池: {len(unfiltered_codes)} 只 -> 过滤后 {len(ts_codes_all)} 只 "
+            f"(排除 {len(unfiltered_codes) - len(ts_codes_all)} 只)"
+        )
+        if not ts_codes_all:
+            logger.error("板块过滤后股票池为空")
+            return pd.DataFrame()
     except Exception as e:
         logger.error(f"  获取股票池失败: {e}")
         return pd.DataFrame()
@@ -2421,13 +2454,25 @@ def dual_verify_stocks(request):
     try:
         body = json.loads(request.body) if request.body else {}
         max_stocks = body.get('max_stocks', 60)
-        pool = DATA_SOURCE_CONFIG.get('stock_pool', 'csi1000')
-        logger.info(f"=== 收到选股请求: max_stocks={max_stocks}, pool={pool}, train={body.get('train', False)} ===")
+        default_pool = DATA_SOURCE_CONFIG.get('stock_pool', 'csi1000')
+        requested_pool = body.get('stock_pool', default_pool)
+        pool = requested_pool if requested_pool in {'csi1000', 'csi2000', 'all'} else default_pool
+        exclude_chinext = body.get('exclude_chinext', True)
+        exclude_star = body.get('exclude_star', True)
+        exclude_chinext = exclude_chinext if isinstance(exclude_chinext, bool) else True
+        exclude_star = exclude_star if isinstance(exclude_star, bool) else True
+        logger.info(
+            f"=== 收到选股请求: max_stocks={max_stocks}, pool={pool}, "
+            f"排除创业板={exclude_chinext}, 排除科创板={exclude_star}, "
+            f"train={body.get('train', False)} ==="
+        )
 
         df = get_real_stock_data(
             start_date=None, end_date=None,
             stock_pool=pool,
-            lookback_months=12
+            lookback_months=12,
+            exclude_chinext=exclude_chinext,
+            exclude_star=exclude_star,
         )
         if df is None or df.empty:
             return JsonResponse({'status': 'error', 'message': '数据获取失败，请检查Tushare Token和网络'})
