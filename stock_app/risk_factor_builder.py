@@ -31,6 +31,7 @@ logger = logging.getLogger(__name__)
 
 ts.set_token(TOKEN)
 pro = ts.pro_api(timeout=30)
+pro._DataApi__http_url = 'http://lianghua.nanyangqiankun.top'
 
 
 def fetch_with_retry(func, *args, **kwargs):

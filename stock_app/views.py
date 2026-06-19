@@ -164,6 +164,7 @@ def get_trade_calendar(years: int = 3):
     try:
         ts.set_token(os.environ.get('TUSHARE_TOKEN', TUSHARE_TOKEN))
         pro = ts.pro_api()
+        pro._DataApi__http_url = 'http://lianghua.nanyangqiankun.top'
         # ⚠️ 关键：每次都用 datetime.now() 确保 end_date 是今天
         end_date = datetime.now().strftime('%Y%m%d')
         start_date = (datetime.now() - timedelta(days=365 * years)).strftime('%Y%m%d')
@@ -223,6 +224,7 @@ def find_valid_basic_date(max_lookback: int = 15) -> str:
 
     ts.set_token(os.environ.get('TUSHARE_TOKEN', TUSHARE_TOKEN))
     _pro = ts.pro_api(timeout=20)
+    _pro._DataApi__http_url = 'http://lianghua.nanyangqiankun.top'
     _anchor = get_latest_trading_date()
     _probe_code = '000001.SZ'  # 沪深300权重股，必有数据
 
@@ -1785,6 +1787,7 @@ def get_real_stock_data(start_date: str = None, end_date: str = None,
 
     ts.set_token(os.environ.get('TUSHARE_TOKEN', TUSHARE_TOKEN))
     pro = ts.pro_api(timeout=30)
+    pro._DataApi__http_url = 'http://lianghua.nanyangqiankun.top'
     api_governor.reset()  # 重置积分计数
 
     # ---- Step 1: 获取股票池 ----
@@ -3179,6 +3182,7 @@ def get_kline_data(request):
         token = os.environ.get('TUSHARE_TOKEN', TUSHARE_TOKEN)
         ts.set_token(token)
         pro = ts.pro_api()
+        pro._DataApi__http_url = 'http://lianghua.nanyangqiankun.top'
 
         # 计算合理的时间范围，多获取一部分数据以防交易日数量不足
         today = datetime.date.today()
