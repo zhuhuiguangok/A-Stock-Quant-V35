@@ -313,7 +313,33 @@ def calculate_rule_factors(
             lambda w: (w[-1] - w.min()) / (w.max() - w.min() + 1e-9), raw=True
         )
     )
+    df['price_position_5d'] = grp['close'].transform(
+        lambda x: x.rolling(5, min_periods=3).apply(
+            lambda w: (w[-1] - w.min()) / (w.max() - w.min() + 1e-9), raw=True
+        )
+    )
+    high_5d = grp['high'].transform(lambda x: x.rolling(5, min_periods=3).max())
+    low_5d = grp['low'].transform(lambda x: x.rolling(5, min_periods=3).min())
+    df['drawdown_5d'] = (df['close'] / (high_5d + 1e-9) - 1.0).clip(-1.0, 0.0)
+    df['range_position_5d'] = (df['close'] - low_5d) / (high_5d - low_5d + 1e-9)
     df['in_bottom_zone'] = (df['price_position_60d'] < 0.2).astype(float)
+
+    # ── 13.5. 5日短线候选因子（只进模型/VIF候选，不直接进手工权重）
+    vol_ma5 = grp['vol'].transform(lambda x: x.rolling(5, min_periods=3).mean().shift(1))
+    amount_ma5 = grp['amount'].transform(lambda x: x.rolling(5, min_periods=3).mean().shift(1))
+    df['vol_ratio_5d'] = df['vol'] / (vol_ma5 + 1e-9)
+    df['amount_ratio_5d'] = df['amount'] / (amount_ma5 + 1e-9)
+    if 'turnover_rate' in df.columns:
+        turnover = pd.to_numeric(df['turnover_rate'], errors='coerce').fillna(0)
+        df['turnover_mean_5d'] = turnover.groupby(df['ts_code']).transform(
+            lambda x: x.rolling(5, min_periods=3).mean()
+        )
+    else:
+        df['turnover_mean_5d'] = 0.0
+    df['return_accel_5d'] = (
+        df['pmt_return_5d'].fillna(0) -
+        (df['pmt_return_20d'].fillna(0) / 4.0)
+    )
 
     # ── 14. 多重超卖合成 ────────────────────────────────────────────
     oversold_flags = ['kdj_oversold', 'rsi_oversold', 'wr_oversold', 'near_boll_lower']

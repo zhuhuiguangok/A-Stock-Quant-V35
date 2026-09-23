@@ -136,6 +136,24 @@ class ModelPersistence:
                 self.save_xgboost(spec_model.xgb_model, name=f"{base_name}_{spec_name}_xgb")
             if hasattr(spec_model, 'nn_model') and spec_model.nn_model is not None:
                 self.save_pytorch(spec_model.nn_model, name=f"{base_name}_{spec_name}_nn")
+
+        # 持久化模型权重与IC历史：否则重启后回退等权+占位IC，
+        # 前端"模型权重分布/IC对比"全部长一个样（2026-09-19 修复）
+        try:
+            import json as _json
+            meta = {
+                'saved_at': datetime.now().isoformat(timespec='seconds'),
+                'model_weights': {k: float(v) for k, v in getattr(engine, 'model_weights', {}).items()},
+                'model_ic_history': {
+                    k: [float(x) for x in list(v)[-10:]]
+                    for k, v in getattr(engine, 'model_ic_history', {}).items() if v
+                },
+            }
+            with open(self._get_path(f"{base_name}_meta", 'json'), 'w', encoding='utf-8') as fh:
+                _json.dump(meta, fh, ensure_ascii=False, default=str)
+            logger.info(f"💾 模型权重/IC元数据已保存: {base_name}_meta.json")
+        except Exception as exc:
+            logger.warning(f"⚠️ 模型元数据保存失败（不影响模型本体）: {exc}")
         logger.info("✅ AI引擎所有模型保存完成")
 
     def load_ai_engine(self, engine, base_name: str = 'ai_engine', check_fresh: bool = True):
@@ -152,11 +170,16 @@ class ModelPersistence:
                 any_success = True
 
         for spec_name, spec_model in engine.special_models.items():
-            if hasattr(spec_model, 'xgb_model') and spec_model.xgb_model is not None:
-                xgb_model = self.load_xgboost(name=f"{base_name}_{spec_name}_xgb", check_fresh=check_fresh)
-                if xgb_model is not None:
-                    spec_model.xgb_model = xgb_model
-                    any_success = True
+            # 【修复】原逻辑 `spec_model.xgb_model is not None` 在冷启动时永远为 False
+            # （SmartXGNN.__init__ 把 xgb_model 初始化为 None），导致 XGB 权重永远加载不回来。
+            # 正确做法：以持久化文件是否存在为准，存在就加载并注入。
+            if hasattr(spec_model, 'xgb_model'):
+                xgb_path = self._get_path(f"{base_name}_{spec_name}_xgb", 'pkl')
+                if os.path.exists(xgb_path):
+                    xgb_model = self.load_xgboost(name=f"{base_name}_{spec_name}_xgb", check_fresh=check_fresh)
+                    if xgb_model is not None:
+                        spec_model.xgb_model = xgb_model
+                        any_success = True
             if hasattr(spec_model, 'nn_model') and spec_model.nn_model is not None:
                 success = self.load_pytorch(spec_model.nn_model, name=f"{base_name}_{spec_name}_nn", check_fresh=check_fresh)
                 if success:
@@ -166,6 +189,25 @@ class ModelPersistence:
             logger.info("✅ AI引擎至少有一个模型加载成功")
         else:
             logger.info("AI引擎暂无已训练权重；如需训练，请勾选“训练模型”后开始分析")
+
+        # 恢复权重/IC元数据（与 save_ai_engine 配套；任何模型加载成功都值得恢复）
+        try:
+            import json as _json
+            meta_path = self._get_path(f"{base_name}_meta", 'json')
+            if os.path.exists(meta_path):
+                with open(meta_path, encoding='utf-8') as fh:
+                    meta = _json.load(fh)
+                weights = meta.get('model_weights') or {}
+                ic_hist = meta.get('model_ic_history') or {}
+                if weights:
+                    engine.model_weights.update(weights)
+                    for name, hist in ic_hist.items():
+                        if not engine.model_ic_history.get(name):
+                            engine.model_ic_history[name] = list(hist)
+                    logger.info(f"♻️ 已恢复模型权重/IC元数据（保存于 {meta.get('saved_at')}）"
+                                f"：{ {k: round(v, 3) for k, v in weights.items()} }")
+        except Exception as exc:
+            logger.warning(f"⚠️ 模型元数据恢复失败（使用默认权重）: {exc}")
         return any_success
 
     # ---------- InterpretableXGBV18 双模型持久化 ----------

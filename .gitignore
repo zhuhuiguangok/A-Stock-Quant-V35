@@ -74,3 +74,21 @@ uv.lock
 *.pem
 *.key
 credentials.json
+
+# === 项目追加 ===
+logs/
+.zcode/
+*.png
+!static/*.png
+_backfill_turnover.py
+_open_browser.py
+jev_sector_forecast.py
+jev_sector_long.py
+jev_sector_v15.py
+jev_sector_v17.py
+jev_sector_v18.py
+jev_v16_sector_to_index.py
+jev_v18_newdims.py
+strategy_frontend_test*.png
+*.bat
+*.bat.deprecated

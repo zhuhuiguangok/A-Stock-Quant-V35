@@ -48,9 +48,12 @@ logger = logging.getLogger(__name__)
 
 # ── 本地模型缓存目录（可在环境变量 SENTIMENT_MODEL_DIR 里覆盖）────────────────
 # 优先级：本地目录 > HuggingFace 默认缓存（~/.cache/huggingface）
-MODEL_LOCAL_DIR = os.environ.get(
-    'SENTIMENT_MODEL_DIR',
-    os.path.join(os.path.dirname(os.path.abspath(__file__)), 'models', 'roberta-jd-binary')
+_DEFAULT_MODEL_DIR = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)), 'models', 'roberta-jd-binary'
+)
+_EXTERNAL_MODEL_DIR = r'D:\stock-quant-models\roberta-jd-binary'
+MODEL_LOCAL_DIR = os.environ.get('SENTIMENT_MODEL_DIR') or (
+    _EXTERNAL_MODEL_DIR if os.path.isdir(_EXTERNAL_MODEL_DIR) else _DEFAULT_MODEL_DIR
 )
 MODEL_HF_ID = 'uer/roberta-base-finetuned-jd-binary-chinese'
 

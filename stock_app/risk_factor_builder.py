@@ -3,7 +3,6 @@
 风险因子数据构建器（增强版）
 每日运行，生成因子暴露和因子收益率，供选股系统使用
 """
-import tushare as ts
 import pandas as pd
 import numpy as np
 import os
@@ -13,8 +12,12 @@ import time
 import warnings
 warnings.filterwarnings('ignore')
 
+try:
+    from .tushare_client import create_tushare_pro
+except ImportError:
+    from stock_app.tushare_client import create_tushare_pro
+
 # ==================== 配置 ====================
-TOKEN = os.environ.get('TUSHARE_TOKEN', '')
 OUTPUT_DIR = './factor_data'
 LOOKBACK_DAYS = 120                # 用于计算因子收益率的历史天数
 BATCH_SIZE = 50                     # 批量获取股票数
@@ -29,9 +32,7 @@ FACTOR_RETURNS_FILE = os.path.join(OUTPUT_DIR, 'factor_returns_history.csv')
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
-ts.set_token(TOKEN)
-pro = ts.pro_api(timeout=30)
-pro._DataApi__http_url = 'http://lianghua.nanyangqiankun.top'
+pro = create_tushare_pro(timeout=30)
 
 
 def fetch_with_retry(func, *args, **kwargs):

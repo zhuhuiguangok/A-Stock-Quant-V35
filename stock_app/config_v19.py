@@ -10,7 +10,7 @@ from dotenv import load_dotenv
 load_dotenv()  # 加载 .env 文件中的环境变量
 
 # ============= Tushare配置 =============
-# 优先读取环境变量，若无则为空。不要在此文件硬编码 Token。
+# 平台统一使用 .env 中的 Token，不在源码中硬编码。
 TUSHARE_TOKEN = os.environ.get("TUSHARE_TOKEN", "")
 TUSHARE_POINTS = int(os.environ.get("TUSHARE_POINTS", 2120))  # 默认假设 2120 积分，可由环境变量覆盖
 

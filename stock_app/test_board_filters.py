@@ -1,3 +1,4 @@
+from tempfile import TemporaryDirectory
 from unittest.mock import patch
 
 import pandas as pd
@@ -39,6 +40,24 @@ class BoardFilterTests(SimpleTestCase):
         )
 
         self.assertEqual(result, codes)
+
+
+class CachedIndexPoolTests(SimpleTestCase):
+    def test_loads_latest_local_constituent_snapshot(self):
+        codes = [f'{index:06d}.SZ' for index in range(700)]
+        frame = pd.DataFrame({
+            'ts_code': codes,
+            'trade_date': ['20260814'] * len(codes),
+        })
+        with TemporaryDirectory() as cache_dir:
+            frame.to_parquet(
+                f'{cache_dir}/real_data_csi1000_20250819_20260814.parquet',
+                index=False,
+            )
+            result = views._load_cached_index_pool('csi1000', cache_dir=cache_dir)
+
+        self.assertEqual(len(result), 700)
+        self.assertEqual(result['ts_code'].nunique(), 700)
 
 
 class SelectionRequestFilterTests(SimpleTestCase):

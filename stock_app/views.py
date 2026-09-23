@@ -28,6 +28,7 @@ import traceback
 import threading
 import uuid
 import concurrent.futures
+import glob
 try:
     import baostock as bs
 except ImportError:
@@ -35,7 +36,7 @@ except ImportError:
 from functools import lru_cache
 from collections import defaultdict
 from django.shortcuts import render
-from django.http import JsonResponse
+from django.http import JsonResponse, FileResponse, Http404
 from django.views.decorators.csrf import csrf_exempt
 from typing import Dict, List, Optional, Tuple, Union
 
@@ -43,7 +44,7 @@ warnings.filterwarnings('ignore')
 
 # ==================== 配置导入 ====================
 from .config_v19 import (
-    TUSHARE_TOKEN, TUSHARE_POINTS,
+    TUSHARE_POINTS,
     USE_SMALL_CAP_FACTORS, USE_AI_MODELS, USE_NLP_SENTIMENT, USE_XGBOOST, USE_XGNN,
     SMALL_CAP_CONFIG, AI_MODEL_CONFIG, NLP_CONFIG, DYNAMIC_WEIGHT_CONFIG, XGNN_CONFIG,
     RISK_CONFIG, LOG_CONFIG, ADVANCED_FACTORS_CONFIG, CHINA_STOCK_CONFIG, DATA_SOURCE_CONFIG,
@@ -82,6 +83,43 @@ from .factor_selector import select_orthogonal_factors as _select_ortho
 # AI模型
 from .models.ai_models import AIAlphaEngine, TORCH_AVAILABLE
 
+from .portfolio_service import (
+    buy_or_add_from_selection,
+    close_holding,
+    get_default_account,
+    run_exit_scan,
+    sell_holding,
+    serialize_account,
+    serialize_holding,
+    set_account_capital,
+)
+from .strategy_lab import BEIJING_CHAOJIA_STRATEGY_ID, STRATEGIES, run_strategy
+from .bull_bear_service import (
+    get_dashboard_payload,
+    start_update as start_bull_bear_update,
+    start_unified_update as start_bull_bear_unified_update,
+    start_refresh_from_cache as start_bull_bear_refresh,
+    chart_path as bull_bear_chart_path,
+)
+from .fund_flow_service import (
+    get_fund_flow_payload,
+    start_update as start_fund_flow_update,
+    start_refresh_from_cache as start_fund_flow_refresh,
+)
+from .model_retrain_service import (
+    get_retrain_status as get_model_retrain_status,
+    start_retrain as start_model_retrain,
+)
+from .research import signals as research_signals
+from .research_service import start_update as start_research_update
+from .global_radar import service as global_radar_svc
+from .global_radar_service import (
+    get_scheduler_status as get_global_radar_scheduler,
+    get_task as get_global_radar_task,
+    start_update as start_global_radar_update,
+)
+from .tushare_client import create_tushare_pro, get_tushare_token
+
 # 小市值因子
 if USE_SMALL_CAP_FACTORS:
     try:
@@ -107,6 +145,13 @@ logger = logging.getLogger(__name__)
 _analysis_tasks = {}
 _analysis_tasks_lock = threading.Lock()
 _analysis_progress = threading.local()
+ANALYSIS_CANCEL_EVENT = threading.Event()  # 协作式取消：多线程拉取批次也能响应
+_strategy_tasks = {}
+_strategy_tasks_lock = threading.Lock()
+
+
+class AnalysisCancelled(Exception):
+    """用户在分析过程中请求取消——在各进度检查点抛出，实现协作式中断。"""
 
 
 def _report_analysis_progress(stage, percent, message, detail=''):
@@ -116,6 +161,10 @@ def _report_analysis_progress(stage, percent, message, detail=''):
     with _analysis_tasks_lock:
         task = _analysis_tasks.get(task_id)
         if task is not None:
+            if task.get('cancel_requested'):
+                ANALYSIS_CANCEL_EVENT.set()
+                task.update({'state': 'cancelling', 'message': '正在取消…', 'updated_at': time.time()})
+                raise AnalysisCancelled('用户取消了本次分析')
             task.update({
                 'stage': stage,
                 'percent': max(0, min(100, int(percent))),
@@ -137,12 +186,39 @@ def _analysis_task_snapshot(task_id):
     return snapshot
 
 
+def _report_strategy_progress(task_id, stage, percent, message, detail=''):
+    if not task_id:
+        return
+    with _strategy_tasks_lock:
+        task = _strategy_tasks.get(task_id)
+        if task is not None:
+            task.update({
+                'stage': stage,
+                'percent': max(0, min(100, int(percent))),
+                'message': message,
+                'detail': detail,
+                'updated_at': time.time(),
+            })
+
+
+def _strategy_task_snapshot(task_id):
+    with _strategy_tasks_lock:
+        task = _strategy_tasks.get(task_id)
+        if task is None:
+            return None
+        snapshot = dict(task)
+    snapshot['elapsed_seconds'] = round(
+        (snapshot.get('finished_at') or time.time()) - snapshot['started_at'], 1
+    )
+    return snapshot
+
+
 # ==================== 全局API简单令牌桶（保护积分）====================
 class _APIGovernor:
     """简单API调用速率控制（避免超出 Tushare 积分）"""
     _COST = {
         'daily': 1, 'daily_basic': 1, 'moneyflow': 2,
-        'limit_list': 2, 'hsgt_top10': 2, 'pledge_stat': 2,
+        'limit_list': 2, 'limit_list_d': 2, 'hsgt_top10': 2, 'pledge_stat': 2,
         'fina_indicator': 3, 'forecast': 2, 'index_weight': 2,
         'stk_factor': 3, 'trade_cal': 0,
     }
@@ -196,9 +272,7 @@ def get_trade_calendar(years: int = 3):
         return cached
 
     try:
-        ts.set_token(os.environ.get('TUSHARE_TOKEN', TUSHARE_TOKEN))
-        pro = ts.pro_api()
-        pro._DataApi__http_url = 'http://lianghua.nanyangqiankun.top'
+        pro = create_tushare_pro()
         # ⚠️ 关键：每次都用 datetime.now() 确保 end_date 是今天
         end_date = datetime.now().strftime('%Y%m%d')
         start_date = (datetime.now() - timedelta(days=365 * years)).strftime('%Y%m%d')
@@ -256,9 +330,7 @@ def find_valid_basic_date(max_lookback: int = 15) -> str:
         logger.info(f"  📅 find_valid_basic_date 命中缓存: {_cached}")
         return _cached
 
-    ts.set_token(os.environ.get('TUSHARE_TOKEN', TUSHARE_TOKEN))
-    _pro = ts.pro_api(timeout=20)
-    _pro._DataApi__http_url = 'http://lianghua.nanyangqiankun.top'
+    _pro = create_tushare_pro(timeout=20)
     _anchor = get_latest_trading_date()
     _probe_code = '000001.SZ'  # 沪深300权重股，必有数据
 
@@ -427,8 +499,33 @@ class V19EnhancedEngine:
         # AI引擎
         if USE_AI_MODELS and TORCH_AVAILABLE:
             try:
+                # 【冷启动维度自适应】配置中的 input_dim 是占位默认值，训练时
+                # train_all_models 会按实际特征数（含技术因子+滞后基本面，通常
+                # 30+维）重建引擎并保存。冷启动若用配置的固定 input_dim 建引擎，
+                # load_state_dict 会因维度不匹配而失败（shape mismatch）。
+                # 修复：从已存的 mlp.pth 推断真实 input_dim；推断失败则回退配置值。
+                cfg_input_dim = AI_MODEL_CONFIG.get('input_dim', 60)
+                actual_input_dim = cfg_input_dim
+                try:
+                    import torch as _torch
+                    _mlp_path = os.path.join(
+                        MODEL_PERSISTENCE.get('model_dir', 'models'),
+                        'ai_engine_mlp.pth')
+                    if os.path.exists(_mlp_path):
+                        _sd = _torch.load(_mlp_path, map_location='cpu',
+                                          weights_only=False)
+                        for _v in _sd.values() if isinstance(_sd, dict) else []:
+                            if hasattr(_v, 'ndim') and _v.ndim == 2:
+                                actual_input_dim = int(_v.shape[1])
+                                logger.info(
+                                    f"  📐 从 ai_engine_mlp.pth 推断 input_dim="
+                                    f"{actual_input_dim}（配置值={cfg_input_dim}）")
+                                break
+                except Exception as _e:
+                    logger.debug(f"推断 input_dim 失败，回退配置值: {_e}")
+
                 self.ai_engine = AIAlphaEngine(
-                    input_dim=AI_MODEL_CONFIG.get('input_dim', 60),
+                    input_dim=actual_input_dim,
                     device=AI_MODEL_CONFIG.get('device', 'cpu')
                 )
                 if AI_MODEL_CONFIG.get('use_mlp', True):
@@ -443,6 +540,20 @@ class V19EnhancedEngine:
                 # 加载AI引擎
                 if MODEL_PERSISTENCE['enable'] and MODEL_PERSISTENCE['auto_load']:
                     self.model_persistence.load_ai_engine(self.ai_engine, 'ai_engine')
+
+                # 【修复】恢复训练时持久化的特征列，使冷启动后 AI 预测特征能对齐
+                # 否则 _ai_feature_cols 未设置 → 预测时 AI 分数恒为 0
+                try:
+                    import json as _json
+                    _fc_path = os.path.join(
+                        MODEL_PERSISTENCE.get('model_dir', 'models'),
+                        'ai_feature_cols.json')
+                    if os.path.exists(_fc_path):
+                        with open(_fc_path, 'r', encoding='utf-8') as _fh:
+                            self._ai_feature_cols = _json.load(_fh)
+                        logger.info(f"  📐 已恢复AI特征列: {len(self._ai_feature_cols)}个 (来自 {_fc_path})")
+                except Exception as _e:
+                    logger.debug(f"恢复AI特征列失败: {_e}")
 
                 logger.info("✅ AI引擎已初始化（MLP/Transformer/SmartXGNN）")
             except Exception as e:
@@ -577,6 +688,10 @@ class V19EnhancedEngine:
             'revenue_yoy_lag1', 'profit_yoy_lag1',
             'vol', 'turnover_rate_lag1',
             'pmt_return_5d', 'pmt_return_20d', 'pmt_return_60d',
+            'vol_ratio_5d', 'amount_ratio_5d',
+            'turnover_mean_5d',
+            'price_position_5d', 'range_position_5d',
+            'drawdown_5d', 'return_accel_5d',
             'vol_ratio_raw', 'volat_hist_20d', 'rsi', 'kdj_k', 'kdj_j',
             'macd', 'ma20_distance', 'boll_position', 'multi_oversold_flag',
             'size_score', 'size_mkt_cap_log',
@@ -600,6 +715,17 @@ class V19EnhancedEngine:
 
         # ========== 保存特征列，供后续预测时对齐 ==========
         self._ai_feature_cols = feature_cols
+        # 持久化特征列到磁盘，使冷启动加载模型后预测时特征能正确对齐
+        try:
+            import json as _json
+            _fc_path = os.path.join(
+                MODEL_PERSISTENCE.get('model_dir', 'models'),
+                'ai_feature_cols.json')
+            with open(_fc_path, 'w', encoding='utf-8') as _fh:
+                _json.dump(feature_cols, _fh, ensure_ascii=False, indent=2)
+            logger.info(f"  💾 AI特征列已持久化: {len(feature_cols)}个 → {_fc_path}")
+        except Exception as _e:
+            logger.warning(f"  ⚠️ 持久化AI特征列失败: {_e}")
 
         # ========== 统一重建 AI 引擎，确保维度匹配并添加所有模型 ==========
         if USE_AI_MODELS and TORCH_AVAILABLE:
@@ -705,30 +831,16 @@ class V19EnhancedEngine:
                         trade_dates_all = df_clean['trade_date'].astype(str).tolist()
                         trade_dates_tr = trade_dates_all[:split]
 
-                    _need_retrain = True
-                    if MODEL_PERSISTENCE['enable'] and MODEL_PERSISTENCE['auto_load']:
-                        try:
-                            _need_retrain = self.ai_engine.should_retrain(
-                                model_dir=MODEL_PERSISTENCE['model_dir'],
-                                base_name='ai_engine',
-                                max_age_days=MODEL_PERSISTENCE.get('max_age_days', 3),
-                                min_ic=0.03
-                            )
-                        except Exception:
-                            _need_retrain = True
-
-                    if _need_retrain:
-                        self.ai_engine.train_all(
-                            X_tr, y_tr,
-                            X_va, y_va,
-                            batch_size=AI_MODEL_CONFIG.get('batch_size', 256),
-                            epochs=AI_MODEL_CONFIG.get('epochs', 30),
-                            trade_dates=trade_dates_tr
-                        )
-                        if MODEL_PERSISTENCE['enable'] and MODEL_PERSISTENCE['auto_save']:
-                            self.model_persistence.save_ai_engine(self.ai_engine, 'ai_engine')
-                    else:
-                        logger.info("  ⏭️ AI引擎模型新鲜且IC达标，跳过重训")
+                    logger.info("  手动训练已触发，强制重训AI引擎（忽略should_retrain缓存判定）")
+                    self.ai_engine.train_all(
+                        X_tr, y_tr,
+                        X_va, y_va,
+                        batch_size=AI_MODEL_CONFIG.get('batch_size', 256),
+                        epochs=AI_MODEL_CONFIG.get('epochs', 30),
+                        trade_dates=trade_dates_tr
+                    )
+                    if MODEL_PERSISTENCE['enable'] and MODEL_PERSISTENCE['auto_save']:
+                        self.model_persistence.save_ai_engine(self.ai_engine, 'ai_engine')
                 trained = True
                 logger.info("  ✅ AI引擎训练完成")
             except Exception as e:
@@ -844,6 +956,11 @@ class V19EnhancedEngine:
             # 动量（5日/20日/60日 → VIF会筛掉冗余）
             'pmt_return_5d', 'pmt_return_20d', 'pmt_return_60d', 'pmt_return_1d',
             'rev_5d_reversal', 'rev_1d_reversal',
+            # 5日短线候选（由VIF筛选决定是否保留）
+            'vol_ratio_5d', 'amount_ratio_5d',
+            'turnover_mean_5d',
+            'price_position_5d', 'range_position_5d',
+            'drawdown_5d', 'return_accel_5d',
             # 量价
             'vol_ratio_raw', 'vol_amount_ratio', 'vol_turnover', 'vol_price_corr',
             # 波动率
@@ -897,6 +1014,10 @@ class V19EnhancedEngine:
                 'total_mv_lag1', 'circ_mv_lag1', 'pe_lag1', 'pb_lag1', 'roe_lag1', 'roa_lag1',
                 'revenue_yoy_lag1', 'profit_yoy_lag1', 'vol', 'turnover_rate_lag1',
                 'pmt_return_5d', 'pmt_return_20d', 'pmt_return_60d',
+                'vol_ratio_5d', 'amount_ratio_5d',
+                'turnover_mean_5d',
+                'price_position_5d', 'range_position_5d',
+                'drawdown_5d', 'return_accel_5d',
                 'vol_ratio_raw', 'volat_hist_20d', 'rsi', 'kdj_k', 'kdj_j',
                 'macd', 'ma20_distance', 'boll_position', 'multi_oversold_flag',
                 'size_score', 'size_mkt_cap_log', 'macd_hist', 'macd_golden',
@@ -1806,6 +1927,418 @@ def _filter_stock_codes(ts_codes, exclude_chinext=True, exclude_star=True):
     return filtered
 
 
+def enrich_limit_pool_fields(df: pd.DataFrame, trade_date: str = None, pro=None) -> pd.DataFrame:
+    """
+    补全涨停池字段，用于名师首板策略的“封单金额/炸板次数/封板时间”。
+
+    这个函数是尽力增强：字段、权限或网络不可用时返回原 df，
+    不影响主选股流程，也不会阻断策略运行。
+    """
+    if df is None or df.empty or 'ts_code' not in df.columns:
+        return df
+    need_cols = {'fd_amount', 'limit_amount', 'first_time', 'last_time', 'open_times', 'up_stat', 'limit_times'}
+    # 即使 df 已有这些列，也可能只是历史行或空列；名师策略需要当天涨停池字段。
+    # 因此总是尝试读取/下载 trade_date 对应的 limit_list_d，再只对空值做回填。
+    try:
+        if trade_date is None and 'trade_date' in df.columns:
+            trade_date = str(df['trade_date'].astype(str).max())
+        trade_date = str(trade_date or '').strip()
+        if not trade_date or trade_date == 'nan':
+            return df
+        if not api_governor.acquire('limit_list_d'):
+            return df
+        if pro is None:
+            pro = create_tushare_pro(timeout=30)
+        fields = (
+            'trade_date,ts_code,name,industry,close,pct_chg,amount,'
+            'limit_amount,float_mv,total_mv,turnover_ratio,fd_amount,'
+            'first_time,last_time,open_times,up_stat,limit_times'
+        )
+        limit_cache_dir = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), 'data_cache')
+        os.makedirs(limit_cache_dir, exist_ok=True)
+        limit_cache_file = os.path.join(limit_cache_dir, f"limit_pool_{trade_date}.parquet")
+        limit_pool = None
+        if os.path.exists(limit_cache_file):
+            try:
+                limit_pool = pd.read_parquet(limit_cache_file)
+                logger.info(f"  ✅ 从本地缓存加载涨停池增强数据: {limit_cache_file}")
+            except Exception as _cache_e:
+                logger.warning(f"  涨停池缓存读取失败，将重新下载: {_cache_e}")
+
+        if limit_pool is None:
+            # limit_list_d 在当前代理上不带 limit_type 更稳定；返回涨停/跌停/炸板池全集，
+            # 策略侧已用日线涨停条件过滤，这里只负责补字段。
+            last_error = None
+            for _attempt in range(3):
+                try:
+                    limit_pool = pro.limit_list_d(trade_date=trade_date, fields=fields)
+                    if limit_pool is not None and not limit_pool.empty:
+                        limit_pool.to_parquet(limit_cache_file)
+                        logger.info(f"  💾 涨停池增强数据已下载并缓存: {limit_cache_file} ({len(limit_pool)}行)")
+                        break
+                except Exception as _e:
+                    last_error = _e
+                    logger.warning(f"  涨停池增强下载第{_attempt + 1}次失败: {_e}")
+                    time.sleep(1.0)
+            if (limit_pool is None or limit_pool.empty) and last_error is not None:
+                raise last_error
+        if limit_pool is None or limit_pool.empty:
+            logger.info(f"  涨停池增强: {trade_date} 无记录或接口返回空")
+            return df
+        limit_pool = limit_pool.drop_duplicates('ts_code').copy()
+        keep = [
+            c for c in [
+                'ts_code', 'fd_amount', 'limit_amount', 'first_time', 'last_time',
+                'open_times', 'up_stat', 'limit_times', 'float_mv', 'total_mv',
+                'turnover_ratio',
+            ] if c in limit_pool.columns
+        ]
+        if len(keep) <= 1:
+            return df
+        # limit_list_d 的 total_mv/float_mv 单位为“元”，daily_basic 的 total_mv/circ_mv
+        # 单位为“万元”。合并前统一成万元，避免策略里的“亿”口径被放大。
+        for _mv_col in ('total_mv', 'float_mv'):
+            if _mv_col in limit_pool.columns:
+                limit_pool[_mv_col] = pd.to_numeric(limit_pool[_mv_col], errors='coerce') / 10000.0
+        enriched = df.merge(limit_pool[keep], on='ts_code', how='left', suffixes=('', '_limitpool'))
+        for _field in ['fd_amount', 'limit_amount', 'first_time', 'last_time', 'open_times', 'up_stat', 'limit_times', 'float_mv', 'turnover_ratio']:
+            _lp_col = f'{_field}_limitpool'
+            if _lp_col not in enriched.columns:
+                continue
+            if _field not in enriched.columns:
+                enriched[_field] = enriched[_lp_col]
+            elif pd.api.types.is_numeric_dtype(enriched[_lp_col]):
+                base = pd.to_numeric(enriched[_field], errors='coerce')
+                fill = pd.to_numeric(enriched[_lp_col], errors='coerce')
+                enriched[_field] = np.where(base.fillna(0).ne(0), base, fill)
+            else:
+                base = enriched[_field].fillna('').astype(str).str.strip()
+                fill = enriched[_lp_col]
+                enriched[_field] = np.where(base.ne('') & base.str.lower().ne('nan'), enriched[_field], fill)
+            enriched.drop(columns=[_lp_col], inplace=True)
+        if 'total_mv_limitpool' in enriched.columns:
+            if 'total_mv' not in enriched.columns:
+                enriched['total_mv'] = enriched['total_mv_limitpool']
+            else:
+                base = pd.to_numeric(enriched['total_mv'], errors='coerce').fillna(0)
+                fill = pd.to_numeric(enriched['total_mv_limitpool'], errors='coerce').fillna(0)
+                enriched['total_mv'] = np.where(base > 0, base, fill)
+            enriched.drop(columns=['total_mv_limitpool'], inplace=True)
+        if 'float_mv' in enriched.columns and 'circ_mv' not in enriched.columns:
+            enriched['circ_mv'] = enriched['float_mv']
+        if 'turnover_ratio' in enriched.columns and 'turnover_rate' not in enriched.columns:
+            enriched['turnover_rate'] = enriched['turnover_ratio']
+        nonnull = enriched['fd_amount'].notna().sum() if 'fd_amount' in enriched.columns else 0
+        logger.info(f"  ✅ 涨停池增强字段合并完成: {nonnull} 行含封单金额/炸板字段")
+        return enriched
+    except Exception as e:
+        logger.warning(f"  涨停池增强字段获取失败，继续使用代理指标: {e}")
+        return df
+
+
+def _is_blank_stock_basic_value(series: pd.Series, treat_unknown: bool = False) -> pd.Series:
+    text = series.fillna('').astype(str).str.strip()
+    blank = text.eq('') | text.str.lower().isin({'nan', 'none', 'null'})
+    if treat_unknown:
+        blank = blank | text.isin({'未知', '无', '--', '-'})
+    return blank
+
+
+def enrich_stock_basic_fields(df: pd.DataFrame, pro=None) -> pd.DataFrame:
+    """
+    补全/修复缓存中的股票名称与行业字段。
+
+    旧缓存可能因为下载中断或接口临时失败，出现 name 缺失、industry 全是“未知”的情况。
+    名家策略里的主线/行业热度评分依赖 industry，因此缓存加载后需要做一次轻量校验和回填。
+    """
+    if df is None or df.empty or 'ts_code' not in df.columns:
+        return df
+
+    name_missing_ratio = 1.0
+    industry_missing_ratio = 1.0
+    name_code_ratio = 1.0
+    if 'name' in df.columns:
+        name_missing_ratio = float(_is_blank_stock_basic_value(df['name']).mean())
+        current_name = df['name'].fillna('').astype(str).str.strip()
+        current_code = df['ts_code'].fillna('').astype(str).str.strip()
+        current_code_prefix = current_code.str.split('.', n=1).str[0]
+        name_code_ratio = float((current_name.eq(current_code) | current_name.eq(current_code_prefix)).mean())
+    if 'industry' in df.columns:
+        industry_missing_ratio = float(_is_blank_stock_basic_value(df['industry'], treat_unknown=True).mean())
+
+    if name_missing_ratio < 0.05 and name_code_ratio < 0.05 and industry_missing_ratio < 0.20:
+        return df
+
+    try:
+        if pro is None:
+            pro = create_tushare_pro(timeout=30)
+
+        stock_basic_info = pro.stock_basic(
+            exchange='',
+            list_status='L',
+            fields='ts_code,name,industry'
+        )
+        if stock_basic_info is None or stock_basic_info.empty:
+            return df
+
+        stock_basic_info = stock_basic_info[['ts_code', 'name', 'industry']].copy()
+        stock_basic_info['ts_code'] = stock_basic_info['ts_code'].astype(str)
+        enriched = df.copy()
+        enriched['ts_code'] = enriched['ts_code'].astype(str)
+        enriched = enriched.merge(stock_basic_info, on='ts_code', how='left', suffixes=('', '_basic'))
+
+        for col, treat_unknown in [('name', False), ('industry', True)]:
+            basic_col = f'{col}_basic'
+            if basic_col not in enriched.columns:
+                continue
+            if col not in enriched.columns:
+                enriched[col] = enriched[basic_col]
+            else:
+                blank = _is_blank_stock_basic_value(enriched[col], treat_unknown=treat_unknown)
+                if col == 'name':
+                    current_name = enriched[col].fillna('').astype(str).str.strip()
+                    current_code = enriched['ts_code'].fillna('').astype(str).str.strip()
+                    current_code_prefix = current_code.str.split('.', n=1).str[0]
+                    blank = blank | current_name.eq(current_code) | current_name.eq(current_code_prefix)
+                fill = enriched[basic_col]
+                enriched[col] = np.where(blank & fill.notna(), fill, enriched[col])
+            enriched.drop(columns=[basic_col], inplace=True)
+
+        fixed_name_missing = float(_is_blank_stock_basic_value(enriched['name']).mean()) if 'name' in enriched.columns else 1.0
+        fixed_industry_missing = float(_is_blank_stock_basic_value(enriched['industry'], treat_unknown=True).mean()) if 'industry' in enriched.columns else 1.0
+        logger.info(
+            "  ✅ 股票基础信息补全完成 | name缺失 %.1f%%→%.1f%% | industry缺失/未知 %.1f%%→%.1f%%",
+            name_missing_ratio * 100,
+            fixed_name_missing * 100,
+            industry_missing_ratio * 100,
+            fixed_industry_missing * 100,
+        )
+        return enriched
+    except Exception as e:
+        logger.warning(f"  股票基础信息补全失败，继续使用当前缓存: {e}")
+        return df
+
+
+def _normalize_index_weight_pool(stocks: pd.DataFrame, index_code: str) -> pd.DataFrame:
+    """index_weight 默认可能返回多期历史成分；这里只保留最新一期成分股。"""
+    if stocks is None or stocks.empty:
+        return stocks
+    normalized = stocks.copy()
+    if 'con_code' in normalized.columns and 'ts_code' not in normalized.columns:
+        normalized = normalized.rename(columns={'con_code': 'ts_code'})
+    if 'trade_date' in normalized.columns:
+        normalized['trade_date'] = normalized['trade_date'].astype(str)
+        latest_weight_date = normalized['trade_date'].max()
+        before = len(normalized)
+        normalized = normalized[normalized['trade_date'] == latest_weight_date].copy()
+        logger.info(
+            f"  指数股票池 {index_code}: 使用最新成分日期 {latest_weight_date}, "
+            f"{before} 条历史权重 -> {normalized['ts_code'].nunique()} 只成分股"
+        )
+    return normalized.drop_duplicates('ts_code')
+
+
+def _load_csindex_pool(stock_pool: str) -> pd.DataFrame:
+    """Load current CSI constituents from the China Securities Index source."""
+    index_symbols = {'csi1000': '000852', 'csi2000': '932000'}
+    symbol = index_symbols.get(stock_pool)
+    if not symbol:
+        return pd.DataFrame()
+
+    try:
+        import akshare as ak
+
+        raw = ak.index_stock_cons_csindex(symbol=symbol)
+        if raw is None or raw.empty:
+            return pd.DataFrame()
+
+        code_col = '成分券代码'
+        exchange_col = '交易所'
+        date_col = '日期'
+        if code_col not in raw.columns or exchange_col not in raw.columns:
+            logger.warning("中证指数接口返回字段不完整: %s", list(raw.columns))
+            return pd.DataFrame()
+
+        def _to_ts_code(row):
+            code = str(row[code_col]).strip().zfill(6)
+            exchange = str(row[exchange_col])
+            suffix = (
+                '.SZ' if '深圳' in exchange else
+                '.SH' if '上海' in exchange else
+                '.BJ' if '北京' in exchange else
+                ''
+            )
+            return f'{code}{suffix}' if suffix else ''
+
+        result = raw.copy()
+        result['ts_code'] = result.apply(_to_ts_code, axis=1)
+        result = result[result['ts_code'].ne('')].drop_duplicates('ts_code')
+        if result.empty:
+            return pd.DataFrame()
+
+        source_date = str(result[date_col].iloc[0]) if date_col in result.columns else 'unknown'
+        logger.info(
+            "✅ 中证指数成分获取成功: %s | 日期=%s | %s 只",
+            symbol,
+            source_date,
+            len(result),
+        )
+        return result[['ts_code']].copy()
+    except Exception as exc:
+        logger.warning("中证指数成分获取失败 (%s): %s", symbol, exc)
+        return pd.DataFrame()
+
+
+def _load_cached_index_pool(stock_pool: str, cache_dir: str = None) -> pd.DataFrame:
+    """Load the latest local constituent snapshot when the index endpoint is unavailable."""
+    if stock_pool not in {'csi1000', 'csi2000'}:
+        return pd.DataFrame()
+
+    if cache_dir is None:
+        cache_dir = os.path.join(
+            os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+            'data_cache',
+        )
+    pattern = os.path.join(cache_dir, f'real_data_{stock_pool}_*.parquet')
+    paths = sorted(glob.glob(pattern), key=os.path.getmtime, reverse=True)
+    for path in paths:
+        try:
+            snapshot = pd.read_parquet(path)
+            if snapshot.empty or 'ts_code' not in snapshot.columns:
+                continue
+            snapshot['ts_code'] = snapshot['ts_code'].astype(str)
+            if 'trade_date' in snapshot.columns:
+                latest_date = snapshot['trade_date'].astype(str).max()
+                snapshot = snapshot[snapshot['trade_date'].astype(str) == latest_date]
+            snapshot = snapshot.drop_duplicates('ts_code')[['ts_code']].copy()
+            if len(snapshot) >= (700 if stock_pool == 'csi1000' else 1400):
+                logger.warning(
+                    "⚠️ %s 指数接口返回空，使用本地成分快照: %s (%s 只)",
+                    stock_pool,
+                    os.path.basename(path),
+                    len(snapshot),
+                )
+                return snapshot
+        except Exception as exc:
+            logger.warning("读取 %s 本地成分快照失败: %s", os.path.basename(path), exc)
+    return pd.DataFrame()
+
+
+def _fallback_market_cap_pool(pro, stock_pool: str, trade_date: str) -> pd.DataFrame:
+    """Build a size-ranked fallback pool if no index constituent snapshot exists."""
+    target = 1000 if stock_pool == 'csi1000' else 2000
+    try:
+        basic = pro.stock_basic(
+            exchange='',
+            list_status='L',
+            fields='ts_code,name,industry',
+        )
+        if basic is None or basic.empty:
+            return pd.DataFrame()
+        basic = basic.drop_duplicates('ts_code')
+        daily_basic = pro.daily_basic(
+            ts_code='',
+            trade_date=trade_date,
+            fields='ts_code,total_mv,circ_mv',
+        )
+        if daily_basic is None or daily_basic.empty:
+            return pd.DataFrame()
+        ranked = basic.merge(daily_basic, on='ts_code', how='inner')
+        ranked['total_mv'] = pd.to_numeric(ranked['total_mv'], errors='coerce')
+        ranked = ranked.dropna(subset=['total_mv']).sort_values('total_mv').head(target)
+        if ranked.empty:
+            return pd.DataFrame()
+        logger.warning(
+            "⚠️ %s 指数接口和本地快照均不可用，使用当日总市值排序兜底: %s 只",
+            stock_pool,
+            len(ranked),
+        )
+        return ranked[['ts_code', 'name', 'industry']].copy()
+    except Exception as exc:
+        logger.error("%s 市值排序兜底失败: %s", stock_pool, exc)
+        return pd.DataFrame()
+
+
+def _cache_quality_issues(
+    df: pd.DataFrame,
+    cache_file: str,
+    stock_pool: str,
+    exclude_chinext: bool = True,
+    exclude_star: bool = True,
+) -> List[str]:
+    """识别明显不可信的行情缓存，避免旧脏缓存继续污染策略。"""
+    issues: List[str] = []
+    if df is None or df.empty:
+        return ['empty_cache']
+    if 'trade_date' not in df.columns or 'ts_code' not in df.columns:
+        return ['missing_trade_date_or_ts_code']
+
+    latest_date = str(df['trade_date'].astype(str).max())
+    latest = df[df['trade_date'].astype(str) == latest_date]
+    latest_codes = latest['ts_code'].nunique()
+
+    if stock_pool == 'csi1000' and latest_codes > 1500:
+        issues.append(f'csi1000_latest_codes_abnormal:{latest_codes}')
+    if stock_pool == 'csi2000' and latest_codes > 2600:
+        issues.append(f'csi2000_latest_codes_abnormal:{latest_codes}')
+    if stock_pool == 'all' and exclude_chinext and exclude_star and latest_codes < 2800:
+        issues.append(f'all_pool_latest_codes_too_low:{latest_codes}')
+
+    if 'name' in latest.columns:
+        name = latest['name'].fillna('').astype(str).str.strip()
+        code = latest['ts_code'].fillna('').astype(str).str.strip()
+        code_prefix = code.str.split('.', n=1).str[0]
+        if float((name.eq(code) | name.eq(code_prefix)).mean()) > 0.05:
+            issues.append('name_equals_code_ratio_gt_5pct')
+    else:
+        issues.append('missing_name')
+
+    if 'industry' in latest.columns:
+        industry = latest['industry'].fillna('').astype(str).str.strip()
+        bad_industry_ratio = float(industry.isin(['', '未知', 'nan', 'None', 'null', '--', '-']).mean())
+        if bad_industry_ratio > 0.20:
+            issues.append(f'industry_bad_ratio:{bad_industry_ratio:.2f}')
+    else:
+        issues.append('missing_industry')
+
+    return issues
+
+
+def _cache_index_pool_is_current(
+    df: pd.DataFrame,
+    stock_pool: str,
+    exclude_chinext: bool,
+    exclude_star: bool,
+) -> bool:
+    """Prevent an old cached constituent set from masking a newer index list."""
+    if stock_pool != 'csi1000' or df is None or df.empty:
+        return True
+
+    live_pool = _load_csindex_pool(stock_pool)
+    if live_pool.empty:
+        # A source outage must not make an otherwise valid cache unusable.
+        return True
+
+    expected = set(_filter_stock_codes(
+        live_pool['ts_code'].astype(str).tolist(),
+        exclude_chinext=exclude_chinext,
+        exclude_star=exclude_star,
+    ))
+    latest_date = str(df['trade_date'].astype(str).max()) if 'trade_date' in df.columns else ''
+    actual = set(df.loc[
+        df['trade_date'].astype(str).eq(latest_date), 'ts_code'
+    ].astype(str)) if latest_date and 'ts_code' in df.columns else set()
+    if expected != actual:
+        logger.warning(
+            "⚠️ CSI1000缓存成分已变化，将刷新数据: 缓存=%s只，当前中证成分=%s只，日期=%s",
+            len(actual),
+            len(expected),
+            latest_date,
+        )
+        return False
+    return True
+
+
 def get_real_stock_data(start_date: str = None, end_date: str = None,
                          stock_pool: str = 'csi1000', lookback_months: int = 12,
                          exclude_chinext: bool = True,
@@ -1816,8 +2349,11 @@ def get_real_stock_data(start_date: str = None, end_date: str = None,
     """
     _report_analysis_progress('trade_date', 12, '正在确定最新交易日', '')
     if end_date is None:
-        logger.info(f"  [1/6] 获取最新交易日...")
-        end_date = get_latest_trading_date()
+        logger.info("  [1/6] 获取最新有效行情日...")
+        # 交易日历可能已经到今天，但 Tushare daily/daily_basic 往往盘后才出数。
+        # 这里用实际有 daily_basic 数据的日期作为默认 end_date，避免前端默认请求
+        # 命中“交易日历最新但行情未落库”的日期，导致缓存 miss 并重新全市场拉取。
+        end_date = find_valid_basic_date(max_lookback=15)
     if start_date is None:
         start_date = (datetime.strptime(end_date, '%Y%m%d') -
                       timedelta(days=lookback_months * 30)).strftime('%Y%m%d')
@@ -1843,26 +2379,76 @@ def get_real_stock_data(start_date: str = None, end_date: str = None,
             logger.info(f"✅ 从本地缓存加载数据: {cache_file}")
             try:
                 cached_df = pd.read_parquet(cache_file)
+                if not _cache_index_pool_is_current(
+                    cached_df,
+                    stock_pool=stock_pool,
+                    exclude_chinext=exclude_chinext,
+                    exclude_star=exclude_star,
+                ):
+                    raise ValueError('csi1000_constituents_changed')
+                before_cols = set(cached_df.columns)
+                before_basic_quality = (
+                    float(_is_blank_stock_basic_value(cached_df['name']).mean()) if 'name' in cached_df.columns else 1.0,
+                    float(_is_blank_stock_basic_value(cached_df['industry'], treat_unknown=True).mean()) if 'industry' in cached_df.columns else 1.0,
+                    float(
+                        (
+                            cached_df['name'].fillna('').astype(str).str.strip().eq(cached_df['ts_code'].fillna('').astype(str).str.strip())
+                            | cached_df['name'].fillna('').astype(str).str.strip().eq(cached_df['ts_code'].fillna('').astype(str).str.strip().str.split('.', n=1).str[0])
+                        ).mean()
+                    ) if 'name' in cached_df.columns and 'ts_code' in cached_df.columns else 1.0,
+                )
+                api_governor.reset()
+                cached_df = enrich_stock_basic_fields(cached_df)
+                cache_trade_date = end_date
+                if cached_df is not None and not cached_df.empty and 'trade_date' in cached_df.columns:
+                    cache_trade_date = str(cached_df['trade_date'].astype(str).max())
+                cached_df = enrich_limit_pool_fields(cached_df, trade_date=cache_trade_date)
+                added_cols = sorted(set(cached_df.columns) - before_cols)
+                after_basic_quality = (
+                    float(_is_blank_stock_basic_value(cached_df['name']).mean()) if 'name' in cached_df.columns else 1.0,
+                    float(_is_blank_stock_basic_value(cached_df['industry'], treat_unknown=True).mean()) if 'industry' in cached_df.columns else 1.0,
+                    float(
+                        (
+                            cached_df['name'].fillna('').astype(str).str.strip().eq(cached_df['ts_code'].fillna('').astype(str).str.strip())
+                            | cached_df['name'].fillna('').astype(str).str.strip().eq(cached_df['ts_code'].fillna('').astype(str).str.strip().str.split('.', n=1).str[0])
+                        ).mean()
+                    ) if 'name' in cached_df.columns and 'ts_code' in cached_df.columns else 1.0,
+                )
+                basic_improved = after_basic_quality != before_basic_quality
+                if added_cols or basic_improved:
+                    cached_df.to_parquet(cache_file)
+                    logger.info(f"💾 已把涨停池补全字段回写缓存: {added_cols}")
+                quality_issues = _cache_quality_issues(
+                    cached_df,
+                    cache_file=cache_file,
+                    stock_pool=stock_pool,
+                    exclude_chinext=exclude_chinext,
+                    exclude_star=exclude_star,
+                )
+                if quality_issues:
+                    logger.warning(f"⚠️ 缓存质量校验未通过，将重新获取数据: {os.path.basename(cache_file)} | {quality_issues}")
+                    raise ValueError(f"cache_quality_failed:{quality_issues}")
                 _report_analysis_progress('cache_loaded', 48, '已读取本地数据缓存', f'{len(cached_df)} 行数据')
                 return cached_df
             except Exception as e:
                 logger.warning(f"⚠️ 读取缓存失败: {e}，将重新获取数据")
 
-    ts.set_token(os.environ.get('TUSHARE_TOKEN', TUSHARE_TOKEN))
-    pro = ts.pro_api(timeout=30)
-    pro._DataApi__http_url = 'http://lianghua.nanyangqiankun.top'
+    pro = create_tushare_pro(timeout=30)
     api_governor.reset()  # 重置积分计数
 
     # ---- Step 1: 获取股票池 ----
     _report_analysis_progress('stock_pool', 18, '正在获取股票池', stock_pool)
     try:
         if stock_pool == 'csi1000':
-            stocks = pro.index_weight(index_code='000852.CSI')
-            if stocks is None or stocks.empty:
-                stocks = pro.stock_basic(exchange='', list_status='L',
-                                          fields='ts_code,name,industry')
+            # The proxy currently returns an empty 000852.CSI table. Use the
+            # current China Securities Index constituent list as the primary source.
+            stocks = _load_csindex_pool(stock_pool)
+            if stocks.empty:
+                stocks = pro.index_weight(index_code='000852.CSI')
+                stocks = _normalize_index_weight_pool(stocks, '000852.CSI')
         elif stock_pool == 'csi2000':
             stocks = pro.index_weight(index_code='932000.CSI')
+            stocks = _normalize_index_weight_pool(stocks, '932000.CSI')
         elif stock_pool == 'all':
             stocks = pro.stock_basic(exchange='', list_status='L',
                                       fields='ts_code,name,industry')
@@ -1871,7 +2457,11 @@ def get_real_stock_data(start_date: str = None, end_date: str = None,
             return pd.DataFrame()
 
         if stocks is None or stocks.empty:
-            logger.error("股票池为空")
+            stocks = _load_cached_index_pool(stock_pool)
+        if stocks is None or stocks.empty:
+            stocks = _fallback_market_cap_pool(pro, stock_pool, end_date)
+        if stocks is None or stocks.empty:
+            logger.error("股票池为空，指数接口、本地快照和市值排序兜底均失败")
             return pd.DataFrame()
 
         # 确保 ts_code 列存在
@@ -1903,7 +2493,9 @@ def get_real_stock_data(start_date: str = None, end_date: str = None,
     all_data: List[pd.DataFrame] = []
     _BASIC_FIELDS = 'ts_code,trade_date,turnover_rate,volume_ratio,pe,pb,ps,total_mv,circ_mv'
 
-    reliable_end_date = get_latest_trading_date()
+    # 尊重调用方传入/上方解析出的 end_date。旧逻辑这里重新取交易日历最新日，
+    # 会把 end_date=20260708 偷偷改成 20260709，造成数据源尚未出数时反复拉取。
+    reliable_end_date = end_date
     reliable_start_date = start_date
 
     # ============================================================
@@ -1998,6 +2590,10 @@ def get_real_stock_data(start_date: str = None, end_date: str = None,
     with concurrent.futures.ThreadPoolExecutor(max_workers=5) as executor:
         futures = {executor.submit(fetch_tushare_batch, i): i for i in range(0, len(ts_codes_all), batch_size)}
         for future in concurrent.futures.as_completed(futures):
+            if ANALYSIS_CANCEL_EVENT.is_set():
+                for f in futures:
+                    f.cancel()
+                raise AnalysisCancelled('用户取消了本次分析')
             res = future.result()
             if res is not None:
                 all_data.append(res)
@@ -2215,6 +2811,8 @@ def get_real_stock_data(start_date: str = None, end_date: str = None,
         except Exception as e:
             logger.warning(f"  涨停数据获取失败: {e}")
 
+    df = enrich_limit_pool_fields(df, trade_date=end_date, pro=pro)
+
     # ---- Step 5: 北向资金偏好（近5日净买入）----
     if api_governor.acquire('hsgt_top10'):
         try:
@@ -2241,22 +2839,67 @@ def get_real_stock_data(start_date: str = None, end_date: str = None,
     #   2. 传 end_date 限定最近一个季度，避免全表扫描超时
     #   3. 若当季无数据，再回退上一季度
     #   4. 自算 pledge_ratio = (unrest + rest) / total * 100
+    # 【2026-09-19 修复】代理 pledge_stat 不支持 offset 且单次截断 3000 条
+    # （全市场 ~5400 家被截半），merge 不上的股票全被 fillna(0) 成"质押率全 0"。
+    # 改为 AkShare 东财股权质押比例为主（一次全市场、只含有质押公司，
+    # 无质押公司本就不在列表、填 0 语义正确），Tushare 降为兜底。
     _pledge_done = False
-    if api_governor.acquire('pledge_stat'):
-        try:
-            logger.info("  [质押] api_governor通过，开始获取质押数据...")
 
-            # 尝试最近季度末（按季度向前找最近3个季度）
-            _today_dt  = datetime.strptime(end_date, '%Y%m%d')
-            _quarter_ends = []
-            for _delta_months in [0, 3, 6]:
-                _m = _today_dt.month - (_today_dt.month - 1) % 3 - _delta_months
-                _y = _today_dt.year
-                while _m <= 0:
-                    _m += 12
-                    _y -= 1
-                _qe = datetime(_y, _m, 1) - timedelta(days=1)
-                _quarter_ends.append(_qe.strftime('%Y%m%d'))
+    _today_dt  = datetime.strptime(end_date, '%Y%m%d')
+    _quarter_ends = []
+    for _delta_months in [0, 3, 6]:
+        _m = _today_dt.month - (_today_dt.month - 1) % 3 - _delta_months
+        _y = _today_dt.year
+        while _m <= 0:
+            _m += 12
+            _y -= 1
+        _qe = datetime(_y, _m, 1) - timedelta(days=1)
+        _quarter_ends.append(_qe.strftime('%Y%m%d'))
+
+    if not _pledge_done:
+        try:
+            import akshare as ak
+
+            def _to_ts_code(code: str) -> str:
+                code = str(code).zfill(6)
+                if code.startswith(('688', '689', '60')):
+                    return f"{code}.SH"
+                if code.startswith(('8', '4', '9')):
+                    return f"{code}.BJ"
+                return f"{code}.SZ"
+
+            for _qdate in _quarter_ends:
+                try:
+                    # AkShare 东财接口只认 YYYYMMDD，不接受带横线格式
+                    _ak = ak.stock_gpzy_pledge_ratio_em(date=_qdate)
+                except Exception:
+                    continue
+                if _ak is None or _ak.empty or '股票代码' not in _ak.columns:
+                    continue
+                _ak = _ak[['股票代码', '质押比例']].copy()
+                _ak['ts_code'] = _ak['股票代码'].astype(str).map(_to_ts_code)
+                _ak['pledge_ratio'] = pd.to_numeric(_ak['质押比例'], errors='coerce')
+                _ak = _ak.dropna(subset=['pledge_ratio'])[['ts_code', 'pledge_ratio']]
+                _ak = _ak.drop_duplicates('ts_code')
+                if _ak.empty:
+                    continue
+                if 'pledge_ratio' in df.columns:
+                    df = df.drop(columns=['pledge_ratio'])
+                df = df.merge(_ak, on='ts_code', how='left')
+                df['pledge_ratio'] = df['pledge_ratio'].fillna(0.0)
+                _nonzero = (df['pledge_ratio'] > 0).sum()
+                logger.info(
+                    f"  [质押] ✅ AkShare东财({_qdate}): 有质押={_nonzero}只 | "
+                    f"均值={df[df['pledge_ratio']>0]['pledge_ratio'].mean():.1f}% | 总={len(df)}只"
+                )
+                _pledge_done = True
+                break
+        except Exception as _ak_err:
+            logger.warning(f"  [质押] AkShare东财源失败，回退Tushare: {_ak_err}")
+
+    if not _pledge_done and api_governor.acquire('pledge_stat'):
+        try:
+            logger.info("  [质押] api_governor通过，开始获取质押数据（Tushare兜底）...")
 
             pledge_raw = None
             for _qdate in _quarter_ends:
@@ -2268,6 +2911,9 @@ def get_real_stock_data(start_date: str = None, end_date: str = None,
                     if _tmp is not None and not _tmp.empty:
                         pledge_raw = _tmp
                         logger.info(f"  [质押] end_date={_qdate} 获取到 {len(pledge_raw)} 条")
+                        if len(pledge_raw) >= 3000:
+                            logger.warning("  [质押] ⚠️ 返回条数触顶3000（代理不支持翻页），"
+                                           "仅覆盖部分市场，质押率可能大面积为0")
                         break
                     else:
                         logger.debug(f"  [质押] end_date={_qdate} 返回空，尝试上一季度")
@@ -2307,8 +2953,8 @@ def get_real_stock_data(start_date: str = None, end_date: str = None,
                 logger.warning("  [质押] 三个季度均返回空，pledge_ratio保持0（检查Tushare积分≥500）")
         except Exception as e:
             logger.error(f"  [质押] 获取异常: {e}")
-    else:
-        logger.warning("  [质押] api_governor积分不足，跳过质押数据获取")
+    elif not _pledge_done:
+        logger.warning("  [质押] api_governor积分不足，跳过Tushare兜底（主源已尝试）")
 
     if not _pledge_done:
         if 'pledge_ratio' not in df.columns:
@@ -2458,8 +3104,18 @@ def get_real_stock_data(start_date: str = None, end_date: str = None,
     
     # ── 保存本地缓存 ──
     try:
-        df.to_parquet(cache_file)
-        logger.info(f"💾 数据已缓存到: {cache_file}")
+        quality_issues = _cache_quality_issues(
+            df,
+            cache_file=cache_file,
+            stock_pool=stock_pool,
+            exclude_chinext=exclude_chinext,
+            exclude_star=exclude_star,
+        )
+        if quality_issues:
+            logger.warning(f"⚠️ 新下载数据质量校验未通过，不写入主缓存: {os.path.basename(cache_file)} | {quality_issues}")
+        else:
+            df.to_parquet(cache_file)
+            logger.info(f"💾 数据已缓存到: {cache_file}")
     except Exception as e:
         logger.warning(f"⚠️ 无法保存缓存: {e}")
         
@@ -2729,7 +3385,9 @@ def dual_verify_stocks(request):
             if _fundamental_veto:  base_conf *= 0.75
             if _trend_vetoed:      base_conf *= 0.90
             if _bottom_vetoed:     base_conf *= 0.93
-            base_conf = int(min(95, max(55, base_conf)))
+            # 下限 35（原 55）：横盘/弱信号行情下多数股票真实置信低于 55，
+            # 钳位会让所有卡片显示同一个 55%（2026-09-19 修复）
+            base_conf = int(min(95, max(35, base_conf)))
 
             # ════════════════════════════════════════════════════════════════
             # 【V30-POSITION】五因子仓位管理（V31 加强 NLP 否决系数）
@@ -3065,8 +3723,11 @@ def dual_verify_stocks(request):
         # 而非"当前市场环境"的好坏。择时信号才是市场状态的真实判断。
         # ══════════════════════════════════════════════════════════════
         _market_score     = market_timing.get('market_score', _market_score or 50.0)
-        _market_confidence = 100.0 if market_timing.get('trend_allowed', True) else 40.0
-        _volatility       = market_timing.get('volatility', _volatility or 0.0) * 100  # → %
+        # 置信度：用择时算法合成的统计置信（方向认同度×信噪比×样本覆盖），不再写死
+        _market_confidence = float(market_timing.get('confidence') or 50.0)
+        # 择时波动率异常为0时，保留此前 selected 统计的兜底值（避免前端显示0%）
+        _mt_vol = market_timing.get('volatility', 0.0)
+        _volatility = (_mt_vol if _mt_vol else (_volatility or 0.0)) * 100  # → %
 
         # 成交量比：selected 的 vol_ratio_raw 中位数
         _vol_ratio = _col_stat('vol_ratio_raw', 'median', fallback=1.0)
@@ -3171,30 +3832,54 @@ def _run_analysis_task(task_id, raw_body):
         response = dual_verify_stocks(request)
         result = json.loads(response.content.decode('utf-8'))
         success = result.get('status') == 'success'
+        cancelled = False
+        with _analysis_tasks_lock:
+            task = _analysis_tasks.get(task_id)
+            if task is not None and task.get('cancel_requested'):
+                cancelled = True
+                success = False
+                result = {'status': 'error', 'message': '用户取消了本次分析'}
+        if success:
+            # 持久化最近一次选股结果：页面刷新/重开后回显，并标注分析时间
+            try:
+                cache_dir = os.path.join(
+                    os.path.dirname(os.path.dirname(os.path.abspath(__file__))), 'data_cache')
+                os.makedirs(cache_dir, exist_ok=True)
+                payload = {
+                    'saved_at': datetime.now().isoformat(timespec='seconds'),
+                    'result': _make_json_serializable(result),
+                }
+                with open(os.path.join(cache_dir, 'last_selection.json'), 'w', encoding='utf-8') as fh:
+                    json.dump(payload, fh, ensure_ascii=False)
+            except Exception as persist_exc:
+                logger.warning(f"保存最近选股结果失败（不影响分析结果）: {persist_exc}")
         with _analysis_tasks_lock:
             _analysis_tasks[task_id].update({
-                'state': 'completed' if success else 'failed',
-                'stage': 'completed' if success else 'failed',
+                'state': 'cancelled' if cancelled else ('completed' if success else 'failed'),
+                'stage': 'cancelled' if cancelled else ('completed' if success else 'failed'),
                 'percent': 100,
-                'message': '选股分析完成' if success else '选股分析失败',
-                'detail': '' if success else result.get('message', '未知错误'),
+                'message': '分析已取消' if cancelled else ('选股分析完成' if success else '选股分析失败'),
+                'detail': '' if cancelled or success else result.get('message', '未知错误'),
                 'result': result,
                 'finished_at': time.time(),
             })
     except Exception as exc:
-        logger.error(f"后台选股任务异常: {exc}\n{traceback.format_exc()}")
+        cancelled = isinstance(exc, AnalysisCancelled)
+        if not cancelled:
+            logger.error(f"后台选股任务异常: {exc}\n{traceback.format_exc()}")
         with _analysis_tasks_lock:
             _analysis_tasks[task_id].update({
-                'state': 'failed',
-                'stage': 'failed',
+                'state': 'cancelled' if cancelled else 'failed',
+                'stage': 'cancelled' if cancelled else 'failed',
                 'percent': 100,
-                'message': '选股分析失败',
-                'detail': str(exc),
-                'result': {'status': 'error', 'message': str(exc)},
+                'message': '分析已取消' if cancelled else '选股分析失败',
+                'detail': '' if cancelled else str(exc),
+                'result': {'status': 'error', 'message': '用户取消了本次分析' if cancelled else str(exc)},
                 'finished_at': time.time(),
             })
     finally:
         _analysis_progress.task_id = None
+        ANALYSIS_CANCEL_EVENT.clear()
 
 
 @csrf_exempt
@@ -3225,6 +3910,29 @@ def start_analysis_task(request):
     return JsonResponse({'status': 'accepted', 'task_id': task_id}, status=202)
 
 
+@csrf_exempt
+def cancel_analysis_task(request):
+    """请求取消进行中的选股分析（协作式：下一个进度检查点生效）。"""
+    if request.method != 'POST':
+        return JsonResponse({'status': 'error', 'message': '仅支持 POST'}, status=405)
+    try:
+        body = json.loads(request.body or b'{}')
+    except (TypeError, ValueError):
+        return JsonResponse({'status': 'error', 'message': '请求 JSON 无效'}, status=400)
+    task_id = str(body.get('task_id') or '').strip()
+    with _analysis_tasks_lock:
+        task = _analysis_tasks.get(task_id)
+        if task is None:
+            return JsonResponse({'status': 'error', 'message': '任务不存在或服务已重启'}, status=404)
+        if task.get('state') not in ('queued', 'running', 'cancelling'):
+            return JsonResponse({'status': 'error', 'message': f"任务已结束（{task.get('state')}），无需取消"}, status=400)
+        task['cancel_requested'] = True
+        task['message'] = '正在取消…'
+        task['updated_at'] = time.time()
+    ANALYSIS_CANCEL_EVENT.set()
+    return JsonResponse({'status': 'accepted', 'state': 'cancelling'})
+
+
 def analysis_task_progress(request):
     snapshot = _analysis_task_snapshot(request.GET.get('task_id', '').strip())
     if snapshot is None:
@@ -3232,6 +3940,680 @@ def analysis_task_progress(request):
             {'status': 'error', 'message': '任务不存在或服务已重启'}, status=404
         )
     return JsonResponse(_make_json_serializable(snapshot))
+
+
+def selection_last_api(request):
+    """最近一次选股分析结果（页面加载时回显，含分析完成时间）。"""
+    try:
+        cache_dir = os.path.join(
+            os.path.dirname(os.path.dirname(os.path.abspath(__file__))), 'data_cache')
+        path = os.path.join(cache_dir, 'last_selection.json')
+        if not os.path.exists(path):
+            return JsonResponse({'status': 'success', 'exists': False})
+        with open(path, encoding='utf-8') as fh:
+            payload = json.load(fh)
+        return JsonResponse({
+            'status': 'success',
+            'exists': True,
+            'saved_at': payload.get('saved_at'),
+            'result': payload.get('result'),
+        })
+    except Exception as e:
+        logger.error(f"读取最近选股结果失败: {e}")
+        return JsonResponse({'status': 'error', 'message': str(e)}, status=400)
+
+
+@csrf_exempt
+def portfolio_account_api(request):
+    """Get/update portfolio capital settings."""
+    try:
+        if request.method == 'POST':
+            body = json.loads(request.body) if request.body else {}
+            account = set_account_capital(body.get('total_capital'))
+        else:
+            account = get_default_account()
+        return JsonResponse({'status': 'success', 'account': serialize_account(account)})
+    except Exception as e:
+        return JsonResponse({'status': 'error', 'message': str(e)}, status=400)
+
+
+@csrf_exempt
+def portfolio_holdings_api(request):
+    """List persisted open holdings."""
+    try:
+        account = get_default_account()
+        current_data = {}
+        if request.method == 'POST':
+            body = json.loads(request.body) if request.body else {}
+            current_data = body.get('current_data', {}) or {}
+        holdings = account.holdings.filter(status='holding').order_by('code')
+        return JsonResponse({
+            'status': 'success',
+            'account': serialize_account(account),
+            'holdings': [serialize_holding(h, current_data=current_data) for h in holdings],
+        })
+    except Exception as e:
+        return JsonResponse({'status': 'error', 'message': str(e)}, status=400)
+
+
+@csrf_exempt
+def portfolio_add_holding_api(request):
+    """Buy/add a selected stock into the persisted portfolio ledger."""
+    if request.method != 'POST':
+        return JsonResponse({'status': 'error', 'message': '仅支持POST'}, status=405)
+    try:
+        body = json.loads(request.body) if request.body else {}
+        stock = body.get('stock') or {}
+        if body.get('source') and 'source' not in stock:
+            stock['source'] = body.get('source')
+        holding = buy_or_add_from_selection(
+            stock=stock,
+            shares=int(body.get('shares', 0)),
+            total_capital=body.get('total_capital'),
+            trade_date=body.get('trade_date'),
+        )
+        return JsonResponse({'status': 'success', 'holding': serialize_holding(holding)})
+    except Exception as e:
+        logger.error(f"加入持仓失败: {e}\n{traceback.format_exc()}")
+        return JsonResponse({'status': 'error', 'message': str(e)}, status=400)
+
+
+@csrf_exempt
+def portfolio_close_holding_api(request):
+    """Mark one holding closed and append a close trade."""
+    if request.method != 'POST':
+        return JsonResponse({'status': 'error', 'message': '仅支持POST'}, status=405)
+    try:
+        body = json.loads(request.body) if request.body else {}
+        holding = close_holding(
+            code=body.get('code'),
+            price=body.get('price'),
+            trade_date=body.get('trade_date'),
+            reason=body.get('reason', 'manual_close'),
+        )
+        return JsonResponse({'status': 'success', 'holding': serialize_holding(holding)})
+    except Exception as e:
+        return JsonResponse({'status': 'error', 'message': str(e)}, status=400)
+
+
+@csrf_exempt
+def portfolio_sell_holding_api(request):
+    """Sell/reduce an open holding and keep an immutable trade record."""
+    if request.method != 'POST':
+        return JsonResponse({'status': 'error', 'message': '仅支持POST'}, status=405)
+    try:
+        body = json.loads(request.body) if request.body else {}
+        holding = sell_holding(
+            code=body.get('code'),
+            shares=body.get('shares'),
+            price=body.get('price'),
+            trade_date=body.get('trade_date'),
+            reason=body.get('reason', 'manual_sell'),
+        )
+        return JsonResponse({'status': 'success', 'holding': serialize_holding(holding)})
+    except Exception as e:
+        return JsonResponse({'status': 'error', 'message': str(e)}, status=400)
+
+
+@csrf_exempt
+def portfolio_exit_scan_api(request):
+    """Run exit scan from persisted holdings; accepts optional current_data override."""
+    if request.method != 'POST':
+        return JsonResponse({'status': 'error', 'message': '仅支持POST'}, status=405)
+    try:
+        body = json.loads(request.body) if request.body else {}
+        report = run_exit_scan(
+            current_data=body.get('current_data', {}) or {},
+            positions_payload=body.get('positions') or None,
+        )
+        return JsonResponse(report)
+    except Exception as e:
+        logger.error(f"持仓巡检失败: {e}\n{traceback.format_exc()}")
+        return JsonResponse({'status': 'error', 'message': str(e)}, status=400)
+
+
+@csrf_exempt
+def strategy_lab_run_api(request):
+    """Run an isolated named-master style strategy synchronously.
+
+    Kept for compatibility/tests. The frontend uses the async task API below.
+    """
+    if request.method != 'POST':
+        return JsonResponse({'status': 'error', 'message': '仅支持POST'}, status=405)
+    try:
+        body = json.loads(request.body) if request.body else {}
+        payload = _execute_strategy_lab(body)
+        return JsonResponse(_make_json_serializable(payload))
+    except Exception as e:
+        logger.error(f"策略工坊运行失败: {e}\n{traceback.format_exc()}")
+        return JsonResponse({'status': 'error', 'message': str(e)}, status=400)
+
+
+def _execute_strategy_lab(body: Dict, task_id: str = None) -> Dict:
+    """Shared strategy execution body for sync and async APIs."""
+    _report_strategy_progress(task_id, 'validate', 5, '校验策略参数')
+    strategy_id = body.get('strategy_id') or BEIJING_CHAOJIA_STRATEGY_ID
+    if strategy_id not in STRATEGIES:
+        raise ValueError(f'未知策略: {strategy_id}')
+
+    _report_strategy_progress(task_id, 'trade_date', 10, '获取最新交易日')
+    # 策略默认日期必须对齐真实可用行情日，而不是单纯交易日历最新日。
+    # 否则盘中/数据未落库时会请求 20260709 这类空日期，导致缓存 miss 或结果为空。
+    end_date = body.get('end_date') or find_valid_basic_date(max_lookback=15)
+    lookback_months = int(body.get('lookback_months') or 3)
+    stock_pool = body.get('stock_pool') or 'all'
+
+    _report_strategy_progress(
+        task_id,
+        'market_data',
+        20,
+        '读取/补齐策略行情数据',
+        f'股票池={stock_pool}，回看={lookback_months}个月，截止={end_date}',
+    )
+    df = get_real_stock_data(
+        end_date=end_date,
+        stock_pool=stock_pool,
+        lookback_months=lookback_months,
+        exclude_chinext=body.get('exclude_chinext', True),
+        exclude_star=body.get('exclude_star', True),
+    )
+
+    strategy_trade_date = end_date
+    row_count = len(df) if df is not None else 0
+    if df is not None and not df.empty and 'trade_date' in df.columns:
+        strategy_trade_date = str(df['trade_date'].astype(str).max())
+    _report_strategy_progress(
+        task_id,
+        'data_ready',
+        58,
+        '策略行情数据就绪',
+        f'{row_count} 行，数据日期={strategy_trade_date}',
+    )
+
+    _report_strategy_progress(task_id, 'limit_pool', 68, '补齐涨停池/封单字段', strategy_trade_date)
+    df = enrich_limit_pool_fields(df, trade_date=strategy_trade_date)
+    strategy_cfg = STRATEGIES[strategy_id]
+
+    _report_strategy_progress(task_id, 'strategy_scoring', 82, '执行名师策略筛选与评分', strategy_cfg.strategy_name)
+    result = run_strategy(
+        strategy_id,
+        df,
+        params={
+            'top_n': body.get('top_n', 30),
+            'mv_min_yi': body.get('mv_min_yi', body.get('mv_min', strategy_cfg.mv_min_yi)),
+            'mv_max_yi': body.get('mv_max_yi', body.get('mv_max', strategy_cfg.mv_max_yi)),
+            'price_min': body.get('price_min', strategy_cfg.price_min),
+            'price_max': body.get('price_max', strategy_cfg.price_max),
+            'recent_limit_days': body.get('recent_limit_days', strategy_cfg.recent_limit_days),
+            'recent_limit_max_count': body.get('recent_limit_max_count', strategy_cfg.recent_limit_max_count),
+            'strong_limit_10d_max': body.get('strong_limit_10d_max', strategy_cfg.strong_limit_10d_max),
+            'strong_limit_30d_max': body.get('strong_limit_30d_max', strategy_cfg.strong_limit_30d_max),
+            'exclude_bj': body.get('exclude_bj', True),
+        },
+    )
+    picks = result.get('picks') or []
+    _report_strategy_progress(task_id, 'completed', 96, '策略结果已生成', f'候选 {len(picks)} 只')
+    return {
+        'status': 'success',
+        'data_date': strategy_trade_date,
+        **result,
+    }
+
+
+def _run_strategy_task(task_id: str, raw_body: bytes) -> None:
+    try:
+        with _strategy_tasks_lock:
+            _strategy_tasks[task_id].update({
+                'state': 'running',
+                'stage': 'running',
+                'percent': 2,
+                'message': '名师策略后台任务启动',
+                'detail': '',
+                'updated_at': time.time(),
+            })
+        body = json.loads(raw_body or b'{}')
+        result = _execute_strategy_lab(body, task_id=task_id)
+        with _strategy_tasks_lock:
+            _strategy_tasks[task_id].update({
+                'state': 'completed',
+                'stage': 'completed',
+                'percent': 100,
+                'message': '名师策略分析完成',
+                'detail': f"候选 {len(result.get('picks') or [])} 只",
+                'result': result,
+                'finished_at': time.time(),
+                'updated_at': time.time(),
+            })
+    except Exception as exc:
+        logger.error(f"名师策略后台任务异常: {exc}\n{traceback.format_exc()}")
+        with _strategy_tasks_lock:
+            _strategy_tasks[task_id].update({
+                'state': 'failed',
+                'stage': 'failed',
+                'percent': 100,
+                'message': '名师策略分析失败',
+                'detail': str(exc),
+                'result': {'status': 'error', 'message': str(exc)},
+                'finished_at': time.time(),
+                'updated_at': time.time(),
+            })
+
+
+@csrf_exempt
+def strategy_lab_start_api(request):
+    """Start an async named-master strategy task and return immediately."""
+    if request.method != 'POST':
+        return JsonResponse({'status': 'error', 'message': '仅支持POST'}, status=405)
+    raw_body = request.body or b'{}'
+    try:
+        json.loads(raw_body)
+    except (TypeError, ValueError):
+        return JsonResponse({'status': 'error', 'message': '请求 JSON 无效'}, status=400)
+
+    task_id = uuid.uuid4().hex
+    now = time.time()
+    with _strategy_tasks_lock:
+        _strategy_tasks[task_id] = {
+            'task_id': task_id, 'state': 'queued', 'stage': 'queued',
+            'percent': 0, 'message': '名师策略任务已进入队列', 'detail': '',
+            'started_at': now, 'updated_at': now, 'finished_at': None,
+            'result': None,
+        }
+    threading.Thread(
+        target=_run_strategy_task,
+        args=(task_id, raw_body),
+        daemon=True,
+        name=f'strategy-{task_id[:8]}',
+    ).start()
+    return JsonResponse({'status': 'accepted', 'task_id': task_id}, status=202)
+
+
+def strategy_lab_progress_api(request):
+    """Return async named-master strategy progress/result."""
+    snapshot = _strategy_task_snapshot(request.GET.get('task_id', '').strip())
+    if snapshot is None:
+        return JsonResponse({'status': 'error', 'message': '任务不存在或服务已重启'}, status=404)
+    return JsonResponse(_make_json_serializable(snapshot))
+
+
+def bull_bear_status_api(request):
+    """Return latest bull/bear cycle signal, history and chart metadata."""
+    try:
+        return JsonResponse({'status': 'success', **_make_json_serializable(get_dashboard_payload())})
+    except Exception as e:
+        logger.error(f"牛熊周期状态读取失败: {e}\n{traceback.format_exc()}")
+        return JsonResponse({'status': 'error', 'message': str(e)}, status=400)
+
+
+@csrf_exempt
+def bull_bear_update_api(request):
+    """Start bull/bear cycle refresh/update in a background thread."""
+    if request.method != 'POST':
+        return JsonResponse({'status': 'error', 'message': '仅支持POST'}, status=405)
+    try:
+        body = json.loads(request.body) if request.body else {}
+        mode = body.get('mode') or 'refresh_cache'
+        fund_flow_task = None
+        if mode == 'full_update':
+            unified_task = start_bull_bear_unified_update(get_tushare_token())
+            task = unified_task.get('bull_bear_task')
+            fund_flow_task = unified_task.get('fund_flow_task')
+        else:
+            task = start_bull_bear_refresh()
+        payload = {'status': 'success', 'task': _make_json_serializable(task)}
+        if fund_flow_task is not None:
+            payload['fund_flow_task'] = _make_json_serializable(fund_flow_task)
+        return JsonResponse(payload)
+    except Exception as e:
+        logger.error(f"牛熊周期更新启动失败: {e}\n{traceback.format_exc()}")
+        return JsonResponse({'status': 'error', 'message': str(e)}, status=400)
+
+
+def bull_bear_chart_api(request, filename):
+    """Serve generated bull/bear chart PNGs from data_cache/bull_bear/pic."""
+    try:
+        return FileResponse(open(bull_bear_chart_path(filename), 'rb'), content_type='image/png')
+    except FileNotFoundError:
+        raise Http404("chart not found")
+
+
+def fund_flow_status_api(request):
+    """Return latest sector fund-flow monitor payload."""
+    try:
+        refresh = str(request.GET.get('refresh', '')).lower() in {'1', 'true', 'yes', 'on'}
+        payload = get_fund_flow_payload(refresh=refresh)
+        return JsonResponse({'status': 'success', **_make_json_serializable(payload)})
+    except Exception as e:
+        logger.error(f"资金流监控读取失败: {e}\n{traceback.format_exc()}")
+        return JsonResponse({'status': 'error', 'message': str(e)}, status=400)
+
+
+@csrf_exempt
+def fund_flow_update_api(request):
+    """Start fund-flow cache refresh or network backfill in a background thread."""
+    if request.method != 'POST':
+        return JsonResponse({'status': 'error', 'message': '仅支持POST'}, status=405)
+    try:
+        body = json.loads(request.body) if request.body else {}
+        mode = body.get('mode') or 'refresh_cache'
+        task = start_fund_flow_update() if mode == 'full_update' else start_fund_flow_refresh()
+        return JsonResponse({'status': 'success', 'task': _make_json_serializable(task)})
+    except Exception as e:
+        logger.error(f"资金流监控更新启动失败: {e}\n{traceback.format_exc()}")
+        return JsonResponse({'status': 'error', 'message': str(e)}, status=400)
+
+
+def model_retrain_status_api(request):
+    """Return model retrain task + weekly scheduler status."""
+    try:
+        return JsonResponse({'status': 'success', **_make_json_serializable(get_model_retrain_status())})
+    except Exception as e:
+        logger.error(f"模型重训状态读取失败: {e}\n{traceback.format_exc()}")
+        return JsonResponse({'status': 'error', 'message': str(e)}, status=400)
+
+
+@csrf_exempt
+def jev_status_api(request):
+    """Jev易术预判：配置 + 最近预测记录。"""
+    try:
+        from .jev_service import get_provider, _load_predictions
+        p = get_provider()
+        preds = _load_predictions()
+        return JsonResponse({'status': 'success',
+                             'provider': {'base': p['base'], 'model': p['model'],
+                                          'has_key': bool(p['key'])},
+                             'predictions': preds[-30:]})
+    except Exception as e:
+        return JsonResponse({'status': 'error', 'message': str(e)}, status=400)
+
+
+@csrf_exempt
+def jev_predict_api(request):
+    """Jev易术预判：生成下一交易日大盘概率 + 板块买入/持续性（自动跳过节假日）。"""
+    if request.method != 'POST':
+        return JsonResponse({'status': 'error', 'message': '仅支持POST'}, status=405)
+    try:
+        from .jev_service import predict_index_next, predict_sectors, _load_index_closes
+        rows = _load_index_closes()
+        latest = max(d for d, _ in rows)
+        target = datetime.strptime(latest, '%Y%m%d').date()
+        idx = predict_index_next()
+        sec = predict_sectors(target)
+        return JsonResponse({'status': 'success',
+                             'target_date': idx.get('target_date') if idx else target.isoformat(),
+                             'index': idx, 'sectors': sec})
+    except Exception as e:
+        logger.error(f"Jev预判失败: {e}\n{traceback.format_exc()}")
+        return JsonResponse({'status': 'error', 'message': str(e)}, status=400)
+
+
+@csrf_exempt
+def sector_forecast_run_api(request):
+    """手动触发板块预测（GBM Top10 + Jev 语义化 Top10）。"""
+    if request.method != 'POST':
+        return JsonResponse({'status': 'error', 'message': '仅支持POST'}, status=405)
+    try:
+        from .sector_forecast_service import run_sector_forecast
+        return JsonResponse({'status': 'success',
+                             'task': _make_json_serializable(run_sector_forecast())})
+    except Exception as e:
+        logger.error(f"板块预测启动失败: {e}")
+        return JsonResponse({'status': 'error', 'message': str(e)}, status=400)
+
+
+def sector_forecast_status_api(request):
+    """板块预测状态 + 最新结果。"""
+    try:
+        from .sector_forecast_service import get_status
+        return JsonResponse({'status': 'success', **_make_json_serializable(get_status())})
+    except Exception as e:
+        logger.error(f"板块预测状态读取失败: {e}")
+        return JsonResponse({'status': 'error', 'message': str(e)}, status=400)
+
+
+@csrf_exempt
+def forecast_run_api(request):
+    """手动触发 AI 预测（GBM 主信号 + Jev/DeepSeek 次要视角）。"""
+    if request.method != 'POST':
+        return JsonResponse({'status': 'error', 'message': '仅支持POST'}, status=405)
+    try:
+        from .forecast_service import run_daily
+        return JsonResponse({'status': 'success', 'task': _make_json_serializable(run_daily())})
+    except Exception as e:
+        logger.error(f"AI预测启动失败: {e}")
+        return JsonResponse({'status': 'error', 'message': str(e)}, status=400)
+
+
+def forecast_status_api(request):
+    """AI 预测状态 + 最新结果。"""
+    try:
+        from .forecast_service import get_status
+        return JsonResponse({'status': 'success', **_make_json_serializable(get_status())})
+    except Exception as e:
+        logger.error(f"AI预测状态读取失败: {e}")
+        return JsonResponse({'status': 'error', 'message': str(e)}, status=400)
+
+
+@csrf_exempt
+def jev_validate_api(request):
+    """Jev易术预判：walk-forward 样本内外验证（days 参数控制回看天数）。"""
+    if request.method != 'POST':
+        return JsonResponse({'status': 'error', 'message': '仅支持POST'}, status=405)
+    try:
+        body = json.loads(request.body or b'{}')
+        days = max(5, min(500, int(body.get('days') or 30)))
+        from .jev_service import validate
+        return JsonResponse({'status': 'success', 'report': _make_json_serializable(validate(days))})
+    except Exception as e:
+        logger.error(f"Jev验证失败: {e}\n{traceback.format_exc()}")
+        return JsonResponse({'status': 'error', 'message': str(e)}, status=400)
+
+
+@csrf_exempt
+def model_retrain_run_api(request):
+    """Manually trigger a full model retrain from local cached data."""
+    if request.method != 'POST':
+        return JsonResponse({'status': 'error', 'message': '仅支持POST'}, status=405)
+    try:
+        task = start_model_retrain(trigger='manual_api')
+        return JsonResponse({'status': 'success', 'task': _make_json_serializable(task)})
+    except Exception as e:
+        logger.error(f"模型重训启动失败: {e}\n{traceback.format_exc()}")
+        return JsonResponse({'status': 'error', 'message': str(e)}, status=400)
+
+
+def research_today_api(request):
+    """今日研报页：最新晨报 + 今日推荐 + 指数行情 + 模块状态（一次取齐）。"""
+    try:
+        limit = int(request.GET.get('limit', 20))
+        payload = research_signals.get_today_payload(limit=limit)
+        from .models import DailyBrief, DailyRecommendation, MarketEvent, ResearchReport
+        from .research_service import get_scheduler_status, get_task
+
+        payload['module_status'] = {
+            'task': get_task(),
+            'scheduler': get_scheduler_status(),
+            'counts': {
+                'reports': ResearchReport.objects.count(),
+                'summarized': ResearchReport.objects.filter(status='summarized').count(),
+                'pending': ResearchReport.objects.filter(status='pending').count(),
+                'briefs': DailyBrief.objects.count(),
+                'recommendations': DailyRecommendation.objects.count(),
+                'events': MarketEvent.objects.count(),
+            },
+        }
+        return JsonResponse({'status': 'success', **_make_json_serializable(payload)})
+    except Exception as e:
+        logger.error(f"研报今日页读取失败: {e}\n{traceback.format_exc()}")
+        return JsonResponse({'status': 'error', 'message': str(e)}, status=400)
+
+
+def research_reports_api(request):
+    """研报库：筛选 + 分页。"""
+    try:
+        payload = research_signals.list_reports(
+            search=request.GET.get('search', '').strip(),
+            sentiment=request.GET.get('sentiment', '').strip(),
+            source=request.GET.get('source', '').strip(),
+            days=int(request.GET.get('days', 30)),
+            limit=min(int(request.GET.get('limit', 50)), 100),
+            offset=int(request.GET.get('offset', 0)),
+        )
+        return JsonResponse({'status': 'success', **_make_json_serializable(payload)})
+    except Exception as e:
+        logger.error(f"研报库读取失败: {e}\n{traceback.format_exc()}")
+        return JsonResponse({'status': 'error', 'message': str(e)}, status=400)
+
+
+@csrf_exempt
+def research_brief_api(request):
+    """最新晨报（POST = 强制重新生成）。"""
+    try:
+        if request.method == 'POST':
+            from .research.services import generate_daily_brief
+
+            result = generate_daily_brief()
+            if result.get('status') != 'success':
+                return JsonResponse({'status': 'success', 'result': result})
+        payload = research_signals.get_today_payload(limit=1)
+        return JsonResponse({'status': 'success', 'brief': _make_json_serializable(payload.get('brief'))})
+    except Exception as e:
+        logger.error(f"晨报读取失败: {e}\n{traceback.format_exc()}")
+        return JsonResponse({'status': 'error', 'message': str(e)}, status=400)
+
+
+def research_signals_api(request):
+    """信号页：共识/事件/盈利预期/上行空间/超预期/跟踪 一次取齐。
+
+    ?sources=1 时只返回数据源清单（研报库视图下拉用，避免触发完整信号计算）。
+    """
+    try:
+        if request.GET.get('sources') == '1':
+            return JsonResponse({'status': 'success', 'sources': _make_json_serializable(research_signals.get_sources())})
+        payload = {
+            'consensus': research_signals.get_stock_consensus(
+                days=int(request.GET.get('days', 7)), limit=int(request.GET.get('limit', 15)),
+            ),
+            'events': research_signals.get_upcoming_events(
+                days_ahead=int(request.GET.get('days_ahead', 30)), limit=30,
+            ),
+            'forecast_consensus': research_signals.get_forecast_consensus(limit=16),
+            'target_upside': research_signals.get_target_upside(limit=12),
+            'surprises': research_signals.get_surprises(limit=12),
+            'tracking': research_signals.get_tracking_stats(),
+            'sources': research_signals.get_sources(),
+        }
+        return JsonResponse({'status': 'success', **_make_json_serializable(payload)})
+    except Exception as e:
+        logger.error(f"研报信号读取失败: {e}\n{traceback.format_exc()}")
+        return JsonResponse({'status': 'error', 'message': str(e)}, status=400)
+
+
+def research_preferences_api(request):
+    """读/写用户偏好（GET/POST）。"""
+    from .models import ResearchPreference
+
+    try:
+        if request.method == 'POST':
+            body = json.loads(request.body) if request.body else {}
+            pref = ResearchPreference.get_solo()
+            if 'watch_stocks' in body:
+                pref.watch_stocks = [str(s).strip() for s in body['watch_stocks'] if str(s).strip()][:50]
+            if 'watch_industries' in body:
+                pref.watch_industries = [str(s).strip() for s in body['watch_industries'] if str(s).strip()][:30]
+            if 'daily_count' in body:
+                pref.daily_count = min(max(int(body['daily_count']), 5), 50)
+            pref.save()
+        pref = ResearchPreference.get_solo()
+        return JsonResponse({'status': 'success', 'preference': _make_json_serializable({
+            'watch_stocks': pref.watch_stocks, 'watch_industries': pref.watch_industries,
+            'daily_count': pref.daily_count,
+        })})
+    except Exception as e:
+        logger.error(f"研报偏好读写失败: {e}\n{traceback.format_exc()}")
+        return JsonResponse({'status': 'error', 'message': str(e)}, status=400)
+
+
+def research_status_api(request):
+    """研报模块：任务状态 + 调度器状态 + 库存计数。"""
+    try:
+        from .models import DailyBrief, DailyRecommendation, MarketEvent, ResearchReport, ResearchSummary
+        from .research_service import get_scheduler_status, get_task
+
+        payload = {
+            'task': get_task(),
+            'scheduler': get_scheduler_status(),
+            'counts': {
+                'reports': ResearchReport.objects.count(),
+                'summarized': ResearchReport.objects.filter(status='summarized').count(),
+                'pending': ResearchReport.objects.filter(status='pending').count(),
+                'summaries': ResearchSummary.objects.count(),
+                'briefs': DailyBrief.objects.count(),
+                'recommendations': DailyRecommendation.objects.count(),
+                'events': MarketEvent.objects.count(),
+            },
+        }
+        return JsonResponse({'status': 'success', **_make_json_serializable(payload)})
+    except Exception as e:
+        logger.error(f"研报状态读取失败: {e}\n{traceback.format_exc()}")
+        return JsonResponse({'status': 'error', 'message': str(e)}, status=400)
+
+
+@csrf_exempt
+def research_update_api(request):
+    """手动触发完整研报流水线。"""
+    if request.method != 'POST':
+        return JsonResponse({'status': 'error', 'message': '仅支持POST'}, status=405)
+    try:
+        task = start_research_update(trigger='manual_api')
+        return JsonResponse({'status': 'success', 'task': _make_json_serializable(task)})
+    except Exception as e:
+        logger.error(f"研报流水线启动失败: {e}\n{traceback.format_exc()}")
+        return JsonResponse({'status': 'error', 'message': str(e)}, status=400)
+
+
+def global_radar_status_api(request):
+    """全球雷达：面板数据 + AI 晨报 + 任务/调度状态。"""
+    try:
+        payload = global_radar_svc.read_dashboard() or {}
+        if not payload:
+            payload = {'date': None, 'meta': {'assets_ok': [], 'sources_failed': []}}
+        brief = payload.get('brief') or global_radar_svc.read_brief()
+        if brief:
+            payload['brief'] = brief
+        payload['task'] = get_global_radar_task()
+        payload['scheduler'] = get_global_radar_scheduler()
+        return JsonResponse({'status': 'success', **_make_json_serializable(payload)})
+    except Exception as e:
+        logger.error(f"全球雷达读取失败: {e}\n{traceback.format_exc()}")
+        return JsonResponse({'status': 'error', 'message': str(e)}, status=400)
+
+
+@csrf_exempt
+def global_radar_update_api(request):
+    """手动触发全球雷达更新（采集 + AI 晨报）。"""
+    if request.method != 'POST':
+        return JsonResponse({'status': 'error', 'message': '仅支持POST'}, status=405)
+    try:
+        task = start_global_radar_update(trigger='manual_api')
+        return JsonResponse({'status': 'success', 'task': _make_json_serializable(task)})
+    except Exception as e:
+        logger.error(f"全球雷达启动失败: {e}\n{traceback.format_exc()}")
+        return JsonResponse({'status': 'error', 'message': str(e)}, status=400)
+
+
+@csrf_exempt
+def global_radar_brief_api(request):
+    """仅重新生成 AI 全球晨报。"""
+    if request.method != 'POST':
+        return JsonResponse({'status': 'error', 'message': '仅支持POST'}, status=405)
+    try:
+        result = global_radar_svc.generate_ai_brief()
+        brief = global_radar_svc.read_brief() or (result.get('brief') if isinstance(result, dict) else None)
+        return JsonResponse({'status': 'success', 'result': _make_json_serializable(result), 'brief': _make_json_serializable(brief)})
+    except Exception as e:
+        logger.error(f"全球晨报生成失败: {e}\n{traceback.format_exc()}")
+        return JsonResponse({'status': 'error', 'message': str(e)}, status=400)
 
 
 @csrf_exempt
@@ -3276,34 +4658,10 @@ def system_status(request):
 
 @csrf_exempt
 def save_token(request):
-    """保存 Tushare Token 到 .env 文件"""
-    if request.method == 'POST':
-        try:
-            data = json.loads(request.body)
-            token = data.get('token', '').strip()
-            if not token:
-                return JsonResponse({'status': 'error', 'message': 'Token 不能为空'})
-            if not (50 <= len(token) <= 70) or not token.isalnum():
-                return JsonResponse({'status': 'error', 'message': '请输入有效的 Tushare Token (长度需在 50~70 位之间，当前输入的长度为' + str(len(token)) + '，请确认是否误粘贴了日志)'})
-            
-            env_path = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), '.env')
-            
-            # 每次保存直接覆盖写入，确保只留存最后新的单个 token，无任何多余或旧内容残留
-            with open(env_path, 'w', encoding='utf-8') as f:
-                f.write(f'TUSHARE_TOKEN={token}\n')
-            
-            # 重新加载环境变量和 ts
-            os.environ['TUSHARE_TOKEN'] = token
-            ts.set_token(token)
-            # config 모듈 변수도 업데이트 (모듈 레벨 변수 동기화)
-            import importlib, sys
-            if 'stock_app.config_v19' in sys.modules:
-                sys.modules['stock_app.config_v19'].TUSHARE_TOKEN = token
-            
-            return JsonResponse({'status': 'success', 'message': 'Token 保存成功'})
-        except Exception as e:
-            return JsonResponse({'status': 'error', 'message': str(e)})
-
+    """Legacy compatibility endpoint; the platform token is built in."""
+    if request.method != 'POST':
+        return JsonResponse({'status': 'error', 'message': 'Only POST is supported'}, status=405)
+    return JsonResponse({'status': 'success', 'message': 'Platform Tushare token is fixed; no input or save is required'})
 
 @csrf_exempt
 def save_sendkey(request):
@@ -3361,10 +4719,7 @@ def get_kline_data(request):
 
     try:
         import datetime
-        token = os.environ.get('TUSHARE_TOKEN', TUSHARE_TOKEN)
-        ts.set_token(token)
-        pro = ts.pro_api()
-        pro._DataApi__http_url = 'http://lianghua.nanyangqiankun.top'
+        pro = create_tushare_pro()
 
         # 计算合理的时间范围，多获取一部分数据以防交易日数量不足
         today = datetime.date.today()

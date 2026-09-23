@@ -69,8 +69,10 @@ def compute_market_timing(df: pd.DataFrame, parent_logger=None) -> Dict:
         _median_ret = 0.0
 
     # 2. 波动率：20日历史波动率均值
+    #    dropna 而非 fillna(0)：NaN 混入均值会把波动率拉成 0，
+    #    导致 high_vol 判定永远不触发、前端显示"波动率 0%"
     if 'volat_hist_20d' in df.columns:
-        _vol = pd.to_numeric(df['volat_hist_20d'], errors='coerce').fillna(0)
+        _vol = pd.to_numeric(df['volat_hist_20d'], errors='coerce').dropna()
         if 'trade_date' in df.columns:
             _latest = df['trade_date'].max()
             _vol_snap = _vol[df['trade_date'] == _latest]
@@ -140,13 +142,46 @@ def compute_market_timing(df: pd.DataFrame, parent_logger=None) -> Dict:
     if _small_cap_ratio > 0.6:
         result['regime'] = f"{result['regime']}_small_dominant"
 
+    # 5. 置信度（2026-09-19：替换写死的 70/40 常数）
+    #    三个可解释成分合成，体现"这个择时判断有多可信"：
+    #    a) 方向认同度——涨/跌家数占比偏离 50% 的显著性（二项近似 z 值）
+    #    b) 信噪比——截面均值收益的 t 统计量（均值/离散度×√n），tanH 映射
+    #    c) 样本覆盖——截面股票数（对数饱和），样本越大越可信
+    #    区间锁定 35~85：不存在 100% 置信的择时，也不给无意义的低分
+    confidence = 50.0
+    try:
+        if 'pmt_return_20d' in df.columns:
+            import math as _math
+            _ret_all = pd.to_numeric(df['pmt_return_20d'], errors='coerce').dropna()
+            if 'trade_date' in df.columns and not _ret_all.empty:
+                _latest_c = df['trade_date'].max()
+                _ret_conf = _ret_all[df['trade_date'] == _latest_c]
+            else:
+                _ret_conf = _ret_all
+            n = int(len(_ret_conf))
+            if n >= 30:
+                pos_ratio = float((_ret_conf > 0).mean())
+                z = abs(pos_ratio - 0.5) / (0.5 / _math.sqrt(n))
+                agree = 0.5 + 0.5 * (1.0 - _math.exp(-z / 3.0))   # 0.55~1.0
+                std = float(_ret_conf.std())
+                t = (float(_ret_conf.mean()) / std * _math.sqrt(n)) if std > 1e-9 else 0.0
+                snr = _math.tanh(abs(t) / 4.0)                     # 0~1
+                cover = min(1.0, 0.4 + 0.12 * _math.log10(max(n, 1)))
+                confidence = 100.0 * max(0.35, min(0.85, 0.5 * agree + 0.3 * snr + 0.2 * cover))
+            else:
+                confidence = 45.0  # 截面样本不足，给保守低置信
+    except Exception:
+        confidence = 50.0
+    result['confidence'] = round(confidence, 1)
+
     log.info(
         f"  📊 市场择时: regime={result['regime']} | "
         f"trend={'✅' if result['trend_allowed'] else '🚫'} | "
         f"trend_w={result['trend_weight_pct']:.0%} | "
         f"市场均收益={_mean_ret:.3f} | "
         f"波动率={result['volatility']:.4f} | "
-        f"评分={result['market_score']:.0f}"
+        f"评分={result['market_score']:.0f} | "
+        f"置信={result['confidence']}%"
     )
     return result
 
