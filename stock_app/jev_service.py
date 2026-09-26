@@ -67,6 +67,23 @@ def get_provider() -> Dict[str, str]:
     return {"base": base.rstrip("/"), "key": key, "model": model, "kind": kind}
 
 
+def _sanitize_state(obj):
+    """NaN/Inf → None，保证 state 可被严格 JSON 序列化（服务端拒绝 NaN 字面量）。"""
+    if isinstance(obj, dict):
+        return {str(k): _sanitize_state(v) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple)):
+        return [_sanitize_state(v) for v in obj]
+    if isinstance(obj, (int, float)) and not isinstance(obj, bool):
+        try:
+            f = float(obj)
+        except (TypeError, ValueError, OverflowError):
+            return None
+        if f != f or f in (float("inf"), float("-inf")):
+            return None
+        return f
+    return obj
+
+
 def _systemone_ask(state: Dict, questions: Dict) -> Optional[Dict]:
     """TypeSafe systemone 原生调用 → answers 字典。失败返回 None。"""
     p = get_provider()
@@ -77,7 +94,9 @@ def _systemone_ask(state: Dict, questions: Dict) -> Optional[Dict]:
         with httpx.Client(timeout=90.0, trust_env=False) as client:
             r = client.post(f"{p['base']}/v1/systemone",
                             headers={"Authorization": f"Bearer {p['key']}"},
-                            json={"model": p["model"], "state": state, "questions": questions})
+                            json={"model": p["model"],
+                                  "state": _sanitize_state(state),
+                                  "questions": questions})
             r.raise_for_status()
             data = r.json()
             return data.get("answers") or {}
@@ -601,10 +620,10 @@ def _macro_known(as_of: _date) -> Dict:
 
         pro = create_tushare_pro(timeout=30)
         out = {}
+        pub_cut = as_of.strftime("%Y%m")  # 当月数据未发布，取上月及以前
         pmi = pro.cn_pmi()
         if pmi is not None and not pmi.empty:
             pmi.columns = [str(c).lower() for c in pmi.columns]
-            pub_cut = as_of.strftime("%Y%m")  # 当月数据未发布，取上月及以前
             sub = pmi[(pmi["month"] < pub_cut)].dropna(subset=["pmi010000"])
             if not sub.empty:
                 row = sub.iloc[0]

@@ -1,7 +1,9 @@
 # -*- coding: utf-8 -*-
 """模型持久化管理器 - 优化2（支持AIAlphaEngine多模型保存）"""
 import os
+import re
 import joblib
+from pathlib import Path as _Path
 import logging
 from datetime import datetime
 from typing import Dict, Optional, Any, Union
@@ -38,7 +40,9 @@ class ModelPersistence:
         logger.info(f"📁 模型持久化目录: {model_dir} (过期天数: {max_age_days})")
 
     def _get_path(self, name: str, ext: str) -> str:
-        """获取完整文件路径"""
+        """获取完整文件路径（文件名白名单，杜绝路径穿越）"""
+        if not re.fullmatch(r"[A-Za-z0-9_\-]+", str(name)):
+            raise ValueError(f"illegal model name: {name!r}")
         return os.path.join(self.model_dir, f"{name}.{ext}")
 
     def _is_fresh(self, filepath: str) -> bool:
@@ -149,8 +153,8 @@ class ModelPersistence:
                     for k, v in getattr(engine, 'model_ic_history', {}).items() if v
                 },
             }
-            with open(self._get_path(f"{base_name}_meta", 'json'), 'w', encoding='utf-8') as fh:
-                _json.dump(meta, fh, ensure_ascii=False, default=str)
+            _meta_file = _Path(self._get_path(f"{base_name}_meta", 'json'))
+            _meta_file.write_text(_json.dumps(meta, ensure_ascii=False, default=str), encoding='utf-8')
             logger.info(f"💾 模型权重/IC元数据已保存: {base_name}_meta.json")
         except Exception as exc:
             logger.warning(f"⚠️ 模型元数据保存失败（不影响模型本体）: {exc}")
@@ -220,8 +224,7 @@ class ModelPersistence:
             import pickle
             path = self._get_path(name, 'pkl')
             if hasattr(model, 'enhanced_model') and model.enhanced_model is not None:
-                with open(path, 'wb') as f:
-                    pickle.dump(model.enhanced_model, f)
+                _Path(path).write_bytes(pickle.dumps(model.enhanced_model, protocol=4))
                 logger.info(f"💾 树模型已保存: {path}")
                 return True
             else:

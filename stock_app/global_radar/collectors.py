@@ -7,6 +7,7 @@
 from __future__ import annotations
 
 import logging
+import threading
 from datetime import date, timedelta
 from typing import Dict, List, Optional
 
@@ -56,6 +57,22 @@ TENCENT_CODES = {
 FRED_SERIES = {"标普500": "SP500", "纳斯达克": "NASDAQCOM", "道琼斯": "DJIA"}
 
 
+def _bounded(fn, seconds: float):
+    """带硬超时执行——akshare 内部无超时控制，源挂死时整轮采集会被拖住。"""
+    box: Dict[str, object] = {}
+
+    def _run() -> None:
+        try:
+            box["r"] = fn()
+        except Exception:
+            box["r"] = None
+
+    th = threading.Thread(target=_run, daemon=True)
+    th.start()
+    th.join(seconds)
+    return box.get("r")
+
+
 def _fred_series(series_id: str, days: int = 130) -> Optional[List[float]]:
     """FRED 日收盘 CSV → 收盘价序列（升序）。失败返回 None。"""
     try:
@@ -92,7 +109,7 @@ def _kline_closes(secid: str, days: int = 130) -> Optional[List[float]]:
     end = date.today().strftime("%Y%m%d")
     beg = (date.today() - timedelta(days=days)).strftime("%Y%m%d")
     try:
-        with httpx.Client(timeout=12.0, headers=_HEADERS, trust_env=False) as client:
+        with httpx.Client(timeout=8.0, headers=_HEADERS, trust_env=False) as client:
             r = client.get(
                 "http://push2his.eastmoney.com/api/qt/stock/kline/get",
                 params={
@@ -116,18 +133,26 @@ def _kline_closes(secid: str, days: int = 130) -> Optional[List[float]]:
 def fetch_asset_closes(days: int = 130) -> Dict[str, List[float]]:
     """拉全部资产收盘序列——东财/腾讯双源互备。
 
-    顺序：东财 secid 候选依次尝试 → 腾讯日 K → 东财末次重试（防瞬时抖动）。
-    返回序列字典；各资产实际命中源记入日志，便于观察哪个源在服务。
+    顺序：东财 secid 候选依次尝试 → 腾讯日 K → FRED CSV。
+    东财连续 2 个资产全败即熔断，其余资产直接走腾讯/FRED——
+    东财源挂死时每资产 4×超时会把整轮采集拖到十几分钟。
     """
     out: Dict[str, List[float]] = {}
-    stats = {"east": 0, "tencent": 0, "fred": 0, "east-retry": 0, "miss": 0}
+    stats = {"east": 0, "tencent": 0, "fred": 0, "miss": 0}
+    east_dead = False
+    east_fail_streak = 0
     for name, candidates in {**ASSET_SECIDS, **INDEX_SECIDS}.items():
         closes, source = None, None
-        for secid in candidates:
-            closes = _kline_closes(secid, days)
-            if closes:
-                source = "east"
-                break
+        if not east_dead:
+            for secid in candidates:
+                closes = _kline_closes(secid, days)
+                if closes:
+                    source = "east"
+                    break
+            east_fail_streak = east_fail_streak + 1 if not closes else 0
+            if east_fail_streak >= 2:
+                east_dead = True
+                logger.warning("全球雷达: 东财源连续失败，本次运行熔断改走腾讯/FRED")
         if not closes:
             code = TENCENT_CODES.get(name)
             if code:
@@ -140,12 +165,6 @@ def fetch_asset_closes(days: int = 130) -> Dict[str, List[float]]:
                 closes = _fred_series(series_id, days)
                 if closes:
                     source = "fred"
-        if not closes:
-            for secid in candidates:
-                closes = _kline_closes(secid, days)
-                if closes:
-                    source = "east-retry"
-                    break
         if closes:
             out[name] = closes
             stats[source] += 1
@@ -157,18 +176,7 @@ def fetch_asset_closes(days: int = 130) -> Dict[str, List[float]]:
 
 
 def fetch_us10y() -> Optional[List[float]]:
-    """美债 10 年收益率序列（近 60 日）：akshare 东财源 → FRED CSV 兜底。"""
-    try:
-        import akshare as ak
-
-        df = ak.bond_zh_us_rate(start_date="19900101")
-        col = next((c for c in df.columns if "美国" in c and "10" in c), None)
-        if col is not None and df is not None and not df.empty:
-            series = df[col].astype(float).dropna().tolist()
-            if len(series) >= 2:
-                return series[-60:]
-    except Exception:
-        pass
+    """美债 10 年收益率序列（近 60 日）：FRED DGS10 优先 → akshare 东财源兜底。"""
     try:
         with httpx.Client(timeout=12.0, headers=_HEADERS, trust_env=False) as client:
             r = client.get("https://fred.stlouisfed.org/graph/fredgraph.csv", params={"id": "DGS10"})
@@ -178,11 +186,23 @@ def fetch_us10y() -> Optional[List[float]]:
                 return series[-60:]
     except Exception:
         pass
-    return None
+
+    def _ak() -> Optional[List[float]]:
+        import akshare as ak
+
+        df = ak.bond_zh_us_rate(start_date="19900101")
+        col = next((c for c in df.columns if "美国" in c and "10" in c), None)
+        if col is not None and df is not None and not df.empty:
+            series = df[col].astype(float).dropna().tolist()
+            if len(series) >= 2:
+                return series[-60:]
+        return None
+
+    return _bounded(_ak, 20.0)
 
 
 def fetch_btc(days: int = 90) -> Optional[List[float]]:
-    """BTC 收盘序列：CoinGecko 日线（免费无 key）。失败返回 None。"""
+    """BTC 收盘序列：CoinGecko 日线 → FRED CBBTCUSD 兜底。失败返回 None。"""
     try:
         with httpx.Client(timeout=12.0, trust_env=False) as client:
             r = client.get(
@@ -192,6 +212,15 @@ def fetch_btc(days: int = 90) -> Optional[List[float]]:
             prices = (r.json() or {}).get("prices") or []
         if len(prices) >= 2:
             return [float(p[1]) for p in prices]
+    except Exception:
+        pass
+    try:
+        with httpx.Client(timeout=12.0, headers=_HEADERS, trust_env=False) as client:
+            r = client.get("https://fred.stlouisfed.org/graph/fredgraph.csv", params={"id": "CBBTCUSD"})
+            rows = [line.split(",") for line in r.text.strip().splitlines()[1:] if "," in line]
+            series = [float(v) for _, v in rows if v not in ("", ".")]
+            if len(series) >= 2:
+                return series[-days:]
     except Exception:
         pass
     return None
@@ -263,7 +292,8 @@ def fetch_margin() -> Optional[List[tuple]]:
 
 def fetch_qvix() -> Optional[List[float]]:
     """50ETF 期权 QVIX 序列（A 股 VIX）。akshare 源不稳时返回 None。"""
-    try:
+
+    def _ak() -> Optional[List[float]]:
         import akshare as ak
 
         df = ak.index_option_50etf_qvix()
@@ -272,9 +302,8 @@ def fetch_qvix() -> Optional[List[float]]:
         value_col = next((c for c in df.columns if "qvix" in str(c).lower() or "波动" in str(c)), None) or df.columns[-1]
         series = df[value_col].astype(float).dropna().tolist()
         return series[-60:] if len(series) >= 2 else None
-    except Exception as exc:
-        logger.warning(f"QVIX 拉取失败: {exc}")
-        return None
+
+    return _bounded(_ak, 20.0)
 
 
 def fetch_breadth() -> Optional[Dict]:

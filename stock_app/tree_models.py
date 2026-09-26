@@ -1,3 +1,4 @@
+import re
 # -*- coding: utf-8 -*-
 """
 树模型集成模块（私募级 v2 - Python 3.14）
@@ -1206,10 +1207,17 @@ class InterpretableXGBV18:
             return False
         try:
             import pickle
-            save_path = path or os.path.join('models', f'{self.model_name}.pkl')
+            _mn = self.model_name if re.fullmatch(r"[A-Za-z0-9_\-]+", str(self.model_name)) else "model"
+            if path:
+                _base = os.path.realpath('models')
+                save_path = os.path.realpath(path)
+                if not save_path.startswith(_base + os.sep):
+                    raise ValueError('save path 必须位于 models/ 目录内')
+            else:
+                save_path = os.path.join('models', f'{_mn}.pkl')
             os.makedirs(os.path.dirname(os.path.abspath(save_path)), exist_ok=True)
-            with open(save_path, 'wb') as f:
-                pickle.dump(self.enhanced_model, f, protocol=4)
+            from pathlib import Path as _P
+            _P(save_path).write_bytes(pickle.dumps(self.enhanced_model, protocol=4))
             logger.info(f"💾 {self.model_name} 已保存: {save_path}")
             return True
         except Exception as e:

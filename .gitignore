@@ -92,3 +92,6 @@ jev_v18_newdims.py
 strategy_frontend_test*.png
 *.bat
 *.bat.deprecated
+
+# Mimosa 安全扫描器工作目录
+.mimosa/

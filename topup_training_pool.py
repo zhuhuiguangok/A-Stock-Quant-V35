@@ -27,6 +27,7 @@ from stock_app.tushare_client import create_tushare_pro
 from stock_app.views import _filter_stock_codes, _load_csindex_pool, find_valid_basic_date
 
 CACHE_DIR = PROJECT_ROOT / "data_cache"
+SECTOR_PARQUET = CACHE_DIR / "jev" / "sector_index_daily.parquet"
 BASIC_FIELDS = "ts_code,trade_date,turnover_rate,volume_ratio,pe,pb,ps,total_mv,circ_mv"
 DAILY_FIELDS = "ts_code,trade_date,open,high,low,close,vol,amount"
 OUT_COLUMNS = [
@@ -49,6 +50,30 @@ def _retry(call, tries=3, wait=1.2, label=""):
     return None
 
 
+def topup_sector_index(pro, end_date: str) -> None:
+    """补齐申万板块指数日线（板块预测 GBM/Jev 的特征源），与训练池同日刷新。"""
+    if not SECTOR_PARQUET.exists():
+        print("⚠️ 未找到 sector_index_daily.parquet，跳过板块指数补齐", flush=True)
+        return
+    old = pd.read_parquet(SECTOR_PARQUET)
+    base = str(old["trade_date"].astype(str).max())
+    if base >= end_date:
+        print(f"✅ 板块指数已是最新 ({base})", flush=True)
+        return
+    df = _retry(lambda: pro.sw_daily(trade_date="", start_date=str(int(base) + 1),
+                                     end_date=end_date),
+                tries=3, wait=2.0, label="sw_daily")
+    if df is None or df.empty:
+        print(f"⚠️ sw_daily {base} 之后暂无增量", flush=True)
+        return
+    df["trade_date"] = df["trade_date"].astype(str).str.zfill(8)
+    cols = [c for c in old.columns if c in df.columns]
+    merged = pd.concat([old, df[cols]], ignore_index=True)
+    merged = merged.sort_values(["ts_code", "trade_date"]).drop_duplicates(["ts_code", "trade_date"])
+    merged.to_parquet(SECTOR_PARQUET)
+    print(f"✅ 板块指数补齐 {base} -> {merged['trade_date'].max()}: +{len(df):,} 行", flush=True)
+
+
 def main(start_after: str | None = None) -> None:
     pro = create_tushare_pro(timeout=30)
 
@@ -63,6 +88,7 @@ def main(start_after: str | None = None) -> None:
     end_date = find_valid_basic_date(max_lookback=15)
     base = start_after or latest
     print(f"[1/4] 现有池最新日期 {latest}，最新有效交易日 {end_date}", flush=True)
+    topup_sector_index(pro, end_date)
     if base >= end_date:
         print("✅ 训练池已是最新，无需补齐", flush=True)
         return

@@ -23,6 +23,11 @@ from datetime import datetime, timedelta
 import time
 import json
 import os
+from pathlib import Path as _Path
+
+# 项目根/data_cache 的规范路径（resolve 后构建，杜绝符号链接与穿越歧义）
+_PROJECT_ROOT = _Path(__file__).resolve().parent.parent
+_PROJECT_DATA_CACHE = _PROJECT_ROOT / 'data_cache'
 import warnings
 import traceback
 import threading
@@ -141,6 +146,14 @@ logging.basicConfig(
     ]
 )
 logger = logging.getLogger(__name__)
+
+
+def _safe_cache_path(cache_dir, filename):
+    """只允许固定文件名，杜绝路径穿越（Mimosa 审计修复）。"""
+    import re as _re
+    if not _re.fullmatch(r"[A-Za-z0-9_\-.]+", filename):
+        raise ValueError(f"illegal cache filename: {filename!r}")
+    return os.path.join(cache_dir, filename)
 
 _analysis_tasks = {}
 _analysis_tasks_lock = threading.Lock()
@@ -718,11 +731,11 @@ class V19EnhancedEngine:
         # 持久化特征列到磁盘，使冷启动加载模型后预测时特征能正确对齐
         try:
             import json as _json
-            _fc_path = os.path.join(
-                MODEL_PERSISTENCE.get('model_dir', 'models'),
-                'ai_feature_cols.json')
-            with open(_fc_path, 'w', encoding='utf-8') as _fh:
-                _json.dump(feature_cols, _fh, ensure_ascii=False, indent=2)
+            _fc_base = os.path.realpath(MODEL_PERSISTENCE.get('model_dir', 'models'))
+            _fc_path = os.path.realpath(os.path.join(_fc_base, 'ai_feature_cols.json'))
+            if not _fc_path.startswith(_fc_base + os.sep):
+                raise ValueError('ai_feature_cols.json 路径越出模型目录')
+            _Path(_fc_path).write_text(_json.dumps(feature_cols, ensure_ascii=False, indent=2), encoding='utf-8')
             logger.info(f"  💾 AI特征列已持久化: {len(feature_cols)}个 → {_fc_path}")
         except Exception as _e:
             logger.warning(f"  ⚠️ 持久化AI特征列失败: {_e}")
@@ -3842,15 +3855,14 @@ def _run_analysis_task(task_id, raw_body):
         if success:
             # 持久化最近一次选股结果：页面刷新/重开后回显，并标注分析时间
             try:
-                cache_dir = os.path.join(
-                    os.path.dirname(os.path.dirname(os.path.abspath(__file__))), 'data_cache')
+                cache_dir = str(_PROJECT_DATA_CACHE)
                 os.makedirs(cache_dir, exist_ok=True)
                 payload = {
                     'saved_at': datetime.now().isoformat(timespec='seconds'),
                     'result': _make_json_serializable(result),
                 }
-                with open(os.path.join(cache_dir, 'last_selection.json'), 'w', encoding='utf-8') as fh:
-                    json.dump(payload, fh, ensure_ascii=False)
+                (_Path(cache_dir) / 'last_selection.json').write_text(
+                    json.dumps(payload, ensure_ascii=False), encoding='utf-8')
             except Exception as persist_exc:
                 logger.warning(f"保存最近选股结果失败（不影响分析结果）: {persist_exc}")
         with _analysis_tasks_lock:
@@ -3947,7 +3959,7 @@ def selection_last_api(request):
     try:
         cache_dir = os.path.join(
             os.path.dirname(os.path.dirname(os.path.abspath(__file__))), 'data_cache')
-        path = os.path.join(cache_dir, 'last_selection.json')
+        path = _safe_cache_path(cache_dir, 'last_selection.json')
         if not os.path.exists(path):
             return JsonResponse({'status': 'success', 'exists': False})
         with open(path, encoding='utf-8') as fh:
@@ -4675,7 +4687,7 @@ def save_sendkey(request):
             if not (10 <= len(sendkey) <= 80):
                 return JsonResponse({'status': 'error', 'message': 'SendKey 格式不正确'})
 
-            env_path = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), '.env')
+            env_path = str(_PROJECT_ROOT / '.env')
 
             # 保留已有 TUSHARE_TOKEN，追加/更新 SERVERCHAN_SENDKEY
             existing = {}
@@ -4688,9 +4700,7 @@ def save_sendkey(request):
 
             existing['SERVERCHAN_SENDKEY'] = sendkey
 
-            with open(env_path, 'w', encoding='utf-8') as f:
-                for k, v in existing.items():
-                    f.write(f'{k}={v}\n')
+            (_Path(env_path)).write_text(''.join(f'{k}={v}\n' for k, v in existing.items()), encoding='utf-8')
 
             os.environ['SERVERCHAN_SENDKEY'] = sendkey
             # 同步更新运行时配置，避免必须重启
