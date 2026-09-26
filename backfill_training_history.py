@@ -19,6 +19,7 @@
     - 成分名单为"当前 csi1000 成分回溯历史"，存在轻微幸存者偏差；
       代理积分下拿不到逐时点成分，先接受该近似。
 """
+import re
 import sys
 import time
 from datetime import datetime, timedelta
@@ -63,6 +64,8 @@ def _retry(call, tries=3, wait=1.0, label=""):
 
 
 def main(years: int = 4) -> None:
+    # 命令行入参钳制到 1-10 年，防止异常区间拉爆 API 配额
+    years = max(1, min(10, int(years)))
     pro = create_tushare_pro(timeout=30)
 
     end_date = find_valid_basic_date(max_lookback=15)
@@ -153,5 +156,7 @@ def main(years: int = 4) -> None:
 
 
 if __name__ == "__main__":
-    years = int(sys.argv[1]) if len(sys.argv) > 1 else 4
+    _raw = sys.argv[1] if len(sys.argv) > 1 else "4"
+    # 只接受 1-2 位数字年限，其余回退默认 4 年
+    years = int(_raw) if re.fullmatch(r"\d{1,2}", _raw) else 4
     main(years)

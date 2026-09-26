@@ -271,6 +271,40 @@ def _parse_json(text: Optional[str]) -> Optional[Dict]:
     return None
 
 
+def _cache_stale(mapping: Dict, max_lag_days: int = 3) -> bool:
+    """缓存最新日期键落后今天超过 max_lag_days 个自然日 → 需要刷新。"""
+    try:
+        latest = max(str(k) for k in mapping)
+        d = _date.fromisoformat(f"{latest[:4]}-{latest[4:6]}-{latest[6:]}")
+        return (_date.today() - d).days > max_lag_days
+    except Exception:
+        return True
+
+
+def _pool_max_date() -> str:
+    """real_data 合并池的最新交易日（本地 parquet，稳健数据源）。"""
+    import glob as _g
+
+    mx = "0"
+    for fp in _g.glob(str(PROJECT_ROOT / "data_cache" / "real_data_*.parquet")):
+        try:
+            import pandas as pd
+
+            mx = max(mx, str(pd.read_parquet(fp, columns=["trade_date"])["trade_date"].astype(str).max()))
+        except Exception:
+            continue
+    return mx
+
+
+def _pool_stale(mapping: Dict) -> bool:
+    """缓存最新日期键落后 real_data 池最新交易日 → 需要刷新（池是唯一真相）。"""
+    try:
+        latest = max(str(k) for k in mapping)
+        return latest < _pool_max_date()
+    except Exception:
+        return True
+
+
 def _load_index_closes(force: bool = False) -> List[Tuple[str, float]]:
     """上证指数日收盘。缓存过期（最新日落后>3天）自动重拉；拉取失败用旧缓存。"""
     cached = None
@@ -367,11 +401,13 @@ def _fetch_index_from_tushare(days: int = 4300) -> List[Tuple[str, float]]:
 
 
 def _load_fred_cached(series_id: str, cache_name: str, force: bool = False) -> Dict[str, float]:
-    """FRED 日序列全量缓存（date→value）。"""
+    """FRED 日序列全量缓存（date→value），过期自动重拉（FRED T+1 披露，留 4 天余量）。"""
     path = JEV_DIR / cache_name
     if path.exists() and not force:
         try:
-            return json.loads(path.read_text("utf-8"))
+            cached = json.loads(path.read_text("utf-8"))
+            if cached and not _cache_stale(cached, max_lag_days=4):
+                return cached
         except Exception:
             pass
     try:
@@ -479,11 +515,13 @@ def _market_features(rows: List[Tuple[str, float]]) -> Dict:
 
 # ── v2 多维特征（FEATV=2）────────────────────────────────────────────
 def _load_aux_index_close(ts_code: str, cache_name: str, force: bool = False) -> Dict[str, float]:
-    """辅助指数（沪深300/创业板指）date→close 字典，带缓存。"""
+    """辅助指数（沪深300/创业板指）date→close 字典，带缓存+过期自动重拉。"""
     path = JEV_DIR / cache_name
     if path.exists() and not force:
         try:
-            return json.loads(path.read_text("utf-8"))
+            cached = json.loads(path.read_text("utf-8"))
+            if cached and not _cache_stale(cached):
+                return cached
         except Exception:
             pass
     try:
@@ -505,10 +543,12 @@ def _load_aux_index_close(ts_code: str, cache_name: str, force: bool = False) ->
 
 
 def _load_breadth(as_of: _date, force: bool = False) -> Dict[str, float]:
-    """全市场宽度：每交易日上涨家数占比（来自 real_data 合并池，一次性计算后缓存）。"""
+    """全市场宽度：每交易日上涨家数占比（来自 real_data 合并池，池更新后自动重算）。"""
     if BREADTH_CACHE.exists() and not force:
         try:
-            return json.loads(BREADTH_CACHE.read_text("utf-8"))
+            cached = json.loads(BREADTH_CACHE.read_text("utf-8"))
+            if cached and not _pool_stale(cached):
+                return cached
         except Exception:
             pass
     try:
@@ -543,10 +583,12 @@ def _load_breadth(as_of: _date, force: bool = False) -> Dict[str, float]:
 
 
 def _load_margin(force: bool = False) -> Dict[str, float]:
-    """两融余额（沪，亿元）date→balance。"""
+    """两融余额（沪，亿元），过期自动重拉（T+1 披露，留 4 天余量）。"""
     if MARGIN_CACHE.exists() and not force:
         try:
-            return json.loads(MARGIN_CACHE.read_text("utf-8"))
+            cached = json.loads(MARGIN_CACHE.read_text("utf-8"))
+            if cached and not _cache_stale(cached, max_lag_days=4):
+                return cached
         except Exception:
             pass
     try:
@@ -570,11 +612,13 @@ def _load_margin(force: bool = False) -> Dict[str, float]:
 def _load_limit_stats(as_of: _date, force: bool = False) -> Dict[str, Dict]:
     """涨跌停宽度：每交易日 {涨停家数, 跌停家数}（主板±9.7%近似，真实涨跌停价差异已知偏差）。
 
-    由 real_data 合并池一次性计算后缓存。
+    由 real_data 合并池计算，池更新后自动重算。
     """
     if LIMIT_CACHE.exists() and not force:
         try:
-            return json.loads(LIMIT_CACHE.read_text("utf-8"))
+            cached = json.loads(LIMIT_CACHE.read_text("utf-8"))
+            if cached and not _pool_stale(cached):
+                return cached
         except Exception:
             pass
     try:
@@ -643,10 +687,12 @@ def _macro_known(as_of: _date) -> Dict:
 
 
 def _load_gap_series(force: bool = False) -> Dict[str, float]:
-    """隔夜缺口：全市场(开盘/昨收-1)中位数，按日。一次性从 real_data 池计算。"""
+    """隔夜缺口：全市场(开盘/昨收-1)中位数，按日（real_data 池更新后自动重算）。"""
     if GAP_CACHE.exists() and not force:
         try:
-            return json.loads(GAP_CACHE.read_text("utf-8"))
+            cached = json.loads(GAP_CACHE.read_text("utf-8"))
+            if cached and not _pool_stale(cached):
+                return cached
         except Exception:
             pass
     try:
@@ -682,7 +728,14 @@ def _load_zt_history(force: bool = False, back_days: int = 0) -> Dict[str, Dict]
         try:
             saved = json.loads(ZT_CACHE.read_text("utf-8"))
             if saved.get("backfilled"):
-                return saved.get("data") or {}
+                data = saved.get("data") or {}
+                # 最新 limit_pool 文件比缓存新 → 重算（涨停池文件是唯一真相）
+                import glob as _g
+
+                pool_days = [f.split("limit_pool_")[-1].split(".")[0]
+                             for f in _g.glob(str(PROJECT_ROOT / "data_cache" / "limit_pool_*.parquet"))]
+                if not pool_days or max(pool_days) <= max(data or {"0": None}):
+                    return data
         except Exception:
             pass
     try:

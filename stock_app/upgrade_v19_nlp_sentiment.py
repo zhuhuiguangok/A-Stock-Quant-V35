@@ -293,17 +293,18 @@ class StockStilFetcher:
         负面比例固定为 MOCK_NEG_RATIO，略低于 veto 阈值，确保不会错误否决。
         """
         import random
-        num_posts = random.randint(12, 22)  # 模拟帖子数量
+        _sr = random.SystemRandom()  # 加密安全随机源（SAST 要求，模拟用途行为一致）
+        num_posts = _sr.randint(12, 22)  # 模拟帖子数量
         # 加权情绪随机生成，负值略多，模拟市场偏空环境（可配置）
-        weighted_sentiment = round(random.uniform(-0.35, 0.15), 4)
-        positive_ratio = round(random.uniform(0.15, 0.30), 4)
+        weighted_sentiment = round(_sr.uniform(-0.35, 0.15), 4)
+        positive_ratio = round(_sr.uniform(0.15, 0.30), 4)
 
         result = {
             'weighted_sentiment': weighted_sentiment,
             'negative_ratio':     self.MOCK_NEG_RATIO,
             'positive_ratio':     positive_ratio,
             'post_count':         num_posts,
-            'read_weight_mean':   round(random.uniform(1.8, 4.2), 4),
+            'read_weight_mean':   round(_sr.uniform(1.8, 4.2), 4),
             'data_source':        source,
         }
         logger.info(

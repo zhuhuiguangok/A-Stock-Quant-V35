@@ -5,6 +5,7 @@
 默认从 data_cache 里最新 real_data 文件的 max(trade_date) 的下一自然日补到
 最新有效交易日。产出 real_data_csi1000_cyb1_star1_<start>_<end>.parquet。
 """
+import re
 import sys
 import time
 from datetime import datetime, timedelta
@@ -160,4 +161,7 @@ def main(start_after: str | None = None) -> None:
 
 
 if __name__ == "__main__":
-    main(sys.argv[1] if len(sys.argv) > 1 else None)
+    _raw = sys.argv[1] if len(sys.argv) > 1 else None
+    # 起始日期必须严格为 YYYYMMDD，否则忽略（防污点参数流入 API 查询）
+    start_after = _raw if _raw and re.fullmatch(r"\d{8}", _raw) else None
+    main(start_after)

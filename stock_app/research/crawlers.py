@@ -78,9 +78,11 @@ class BaseCrawler:
     source_code: str = ""
     base_url: str = ""
 
+    _ua_random = random.SystemRandom()  # 加密安全随机源（SAST 要求）
+
     def build_headers(self) -> dict:
         return {
-            "User-Agent": random.choice(USER_AGENTS),
+            "User-Agent": self._ua_random.choice(USER_AGENTS),
             "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
             "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
             "Referer": "https://www.baidu.com/",
