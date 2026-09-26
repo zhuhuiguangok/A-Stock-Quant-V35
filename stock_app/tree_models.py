@@ -1241,7 +1241,8 @@ class InterpretableXGBV18:
                 logger.warning(f"⚠️ {self.model_name} 模型文件为空: {load_path}")
                 return False
             with open(load_path, 'rb') as f:
-                self.enhanced_model = pickle.load(f)
+                from .model_persistence import safe_pickle_load
+                self.enhanced_model = safe_pickle_load(f)
 
             # V30向后兼容修复: 旧模型没有 feature_cols 属性，或 feature_cols 早于共线性剪枝锁定
             # 若 feature_cols 存在且与 selected_features/feature_names 不一致，

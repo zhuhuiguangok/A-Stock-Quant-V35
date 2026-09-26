@@ -3,6 +3,7 @@
 import os
 import re
 import joblib
+import pickle
 from pathlib import Path as _Path
 import logging
 from datetime import datetime
@@ -15,6 +16,23 @@ try:
     TORCH_AVAILABLE = True
 except ImportError:
     TORCH_AVAILABLE = False
+
+# 模型文件允许的全局命名空间根：数值数组/树/张量/估计器 + 本项目自有模型类。
+# 白名单之外的全局符号一律拒绝，os/subprocess 等危险模块即使文件被篡改也无法实例化。
+_SAFE_PICKLE_ROOTS = {"numpy", "torch", "xgboost", "lightgbm", "catboost", "sklearn", "scipy",
+                      "collections", "copyreg", "_codecs", "builtins", "stock_app"}
+
+
+class _ModelUnpickler(pickle.Unpickler):
+    def find_class(self, module: str, name: str):
+        if module.split(".")[0] not in _SAFE_PICKLE_ROOTS:
+            raise pickle.UnpicklingError(f"模型文件包含禁止的全局符号: {module}.{name}")
+        return super().find_class(module, name)
+
+
+def safe_pickle_load(fileobj):
+    """白名单受限反序列化（pickle.load 的安全替代）。"""
+    return _ModelUnpickler(fileobj).load()
 
 
 class ModelPersistence:
@@ -75,7 +93,15 @@ class ModelPersistence:
             if check_fresh and not self._is_fresh(path):
                 logger.info(f"⚠️ XGBoost模型已过期（>{self.max_age_days}天），请重新训练")
                 return None
-            model = joblib.load(path)
+            model = None
+            try:
+                # 优先受限反序列化（新格式=plain pickle）；joblib 专有格式走兜底
+                with open(path, 'rb') as f:
+                    model = safe_pickle_load(f)
+            except Exception:
+                model = joblib.load(path)
+            if not hasattr(model, "predict"):
+                raise TypeError(f"反序列化结果不是可预测模型: {type(model)!r}")
             logger.info(f"✅ XGBoost模型加载成功: {path}")
             return model
         except Exception as e:
@@ -115,7 +141,8 @@ class ModelPersistence:
             if check_fresh and not self._is_fresh(path):
                 logger.info(f"⚠️ PyTorch模型已过期（>{self.max_age_days}天），请重新训练")
                 return False
-            model.load_state_dict(torch.load(path))
+            # weights_only=True：只允许张量/原生类型，杜绝模型文件中的任意类实例化
+            model.load_state_dict(torch.load(path, weights_only=True))
             logger.info(f"✅ PyTorch模型加载成功: {path}")
             return True
         except Exception as e:
@@ -249,7 +276,7 @@ class ModelPersistence:
                 logger.info(f"⚠️ 树模型 {name} 已过期（>{self.max_age_days}天），请重新训练")
                 return False
             with open(path, 'rb') as f:
-                enhanced_model = pickle.load(f)
+                enhanced_model = safe_pickle_load(f)
             model.enhanced_model = enhanced_model
             logger.info(f"✅ 树模型加载成功: {path}")
             return True

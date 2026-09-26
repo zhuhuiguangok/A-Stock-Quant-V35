@@ -2216,8 +2216,15 @@ class AIAlphaEngine:
             xgb_path = os.path.join(model_dir, f"{base_name}_{name}_xgb.pkl")
             if os.path.exists(xgb_path) and _is_fresh(xgb_path):
                 try:
-                    import joblib
-                    xgnn.xgb_model = joblib.load(xgb_path)
+                    from ..model_persistence import safe_pickle_load
+                    try:
+                        with open(xgb_path, 'rb') as _fb:
+                            xgnn.xgb_model = safe_pickle_load(_fb)
+                    except Exception:
+                        import joblib
+                        xgnn.xgb_model = joblib.load(xgb_path)
+                    if not hasattr(xgnn.xgb_model, "predict"):
+                        raise TypeError("反序列化结果不是可预测模型")
                     ok_count += 1
                     _elog(f"✅ 加载 {name}_xgb: {xgb_path}")
                 except Exception as e:
@@ -2228,8 +2235,9 @@ class AIAlphaEngine:
                 nn_path = os.path.join(model_dir, f"{base_name}_{name}_nn.pth")
                 if os.path.exists(nn_path) and _is_fresh(nn_path):
                     try:
+                        # weights_only=True：只允许张量/原生类型
                         xgnn.nn_model.load_state_dict(
-                            _torch.load(nn_path, map_location=self.device)
+                            _torch.load(nn_path, map_location=self.device, weights_only=True)
                         )
                         ok_count += 1
                         _elog(f"✅ 加载 {name}_nn: {nn_path}")
@@ -2240,8 +2248,9 @@ class AIAlphaEngine:
         meta_path = _safe_model_path(model_dir, f"{base_name}_meta" + '.pkl')
         if os.path.exists(meta_path):
             try:
+                from ..model_persistence import safe_pickle_load
                 with open(meta_path, 'rb') as f:
-                    meta = pickle.load(f)
+                    meta = safe_pickle_load(f)
                 self.model_weights.update(meta.get('model_weights', {}))
                 self.model_ic_history.update(meta.get('model_ic_history', {}))
                 _elog(f"✅ 加载权重元数据: {meta_path}")
