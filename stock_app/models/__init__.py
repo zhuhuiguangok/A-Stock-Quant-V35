@@ -130,3 +130,32 @@ class PortfolioExitScan(models.Model):
     class Meta:
         db_table = "portfolio_exit_scan"
         ordering = ["-scan_date"]
+
+
+class SelectionRun(models.Model):
+    """一次 AI 选股运行的快照（用于成绩单回测跟踪）。"""
+
+    BUCKET_TREND = "trend"
+    BUCKET_BOTTOM = "bottom"
+
+    data_date = models.CharField(max_length=8)          # 选股数据交易日 YYYYMMDD
+    run_at = models.DateTimeField(auto_now_add=True)
+    pool = models.CharField(max_length=32, default="csi1000")
+    regime = models.CharField(max_length=16, default="neutral")
+    total_count = models.IntegerField(default=0)
+    trend_count = models.IntegerField(default=0)
+    bottom_count = models.IntegerField(default=0)
+    picks = models.JSONField(default=list)               # [{code,name,bucket,buy_score,industry}]
+    stats = models.JSONField(default=dict, blank=True)   # 原始 stats（模型权重等）
+    returns = models.JSONField(default=dict, blank=True) # 回填收益 {code: {t1,t5,t20}}
+    returns_updated_at = models.DateTimeField(null=True, blank=True)
+
+    class Meta:
+        db_table = "selection_run"
+        ordering = ["-run_at"]
+        indexes = [
+            models.Index(fields=["data_date"]),
+        ]
+
+    def __str__(self):
+        return f"{self.data_date} {self.pool} {self.total_count}只"

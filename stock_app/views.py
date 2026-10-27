@@ -3865,6 +3865,16 @@ def _run_analysis_task(task_id, raw_body):
                     json.dumps(payload, ensure_ascii=False), encoding='utf-8')
             except Exception as persist_exc:
                 logger.warning(f"保存最近选股结果失败（不影响分析结果）: {persist_exc}")
+            # 成绩单落库（选股跟踪回测的数据源，失败不影响主流程）
+            try:
+                from .selection_scorecard import record_selection_run
+                try:
+                    _pool = str((json.loads(raw_body) or {}).get('stock_pool') or '')
+                except Exception:
+                    _pool = ''
+                record_selection_run(_make_json_serializable(result), pool=_pool)
+            except Exception as score_exc:
+                logger.warning(f"成绩单落库失败（不影响分析结果）: {score_exc}")
         with _analysis_tasks_lock:
             _analysis_tasks[task_id].update({
                 'state': 'cancelled' if cancelled else ('completed' if success else 'failed'),
@@ -3952,6 +3962,48 @@ def analysis_task_progress(request):
             {'status': 'error', 'message': '任务不存在或服务已重启'}, status=404
         )
     return JsonResponse(_make_json_serializable(snapshot))
+
+
+@csrf_exempt
+def selection_scorecard_api(request):
+    """选股成绩单：聚合历史选股的 T+1/T+5/T+20 跟踪收益。"""
+    try:
+        from .selection_scorecard import aggregate_scorecard, backfill_from_last_selection, refresh_returns
+        if request.method == 'POST':
+            backfill_from_last_selection()
+            updated = refresh_returns(max_runs=30)
+            return JsonResponse({'status': 'success', '回填收益条数': updated})
+        return JsonResponse({'status': 'success', **_make_json_serializable(aggregate_scorecard())})
+    except Exception as e:
+        logger.error(f"成绩单读取失败: {e}\n{traceback.format_exc()}")
+        return JsonResponse({'status': 'error', 'message': str(e)}, status=400)
+
+
+def portfolio_signals_api(request):
+    """持仓信号联动：持仓 × 选股结果 × 周期建议仓位 × 板块资金流。"""
+    try:
+        from .portfolio_signals import build_signals
+        return JsonResponse({'status': 'success', **_make_json_serializable(build_signals())})
+    except Exception as e:
+        logger.error(f"持仓信号联动失败: {e}\n{traceback.format_exc()}")
+        return JsonResponse({'status': 'error', 'message': str(e)}, status=400)
+
+
+@csrf_exempt
+def stock_qa_api(request):
+    """个股问一问小 Agent：聚合全模块数据后由 DeepSeek 大白话答疑。"""
+    if request.method != 'POST':
+        return JsonResponse({'status': 'error', 'message': '仅支持 POST'}, status=405)
+    try:
+        body = json.loads(request.body or b'{}')
+        from .stock_qa_service import ask
+        return JsonResponse({'status': 'success',
+                             **_make_json_serializable(ask(str(body.get('code') or ''),
+                                                           str(body.get('question') or ''),
+                                                           str(body.get('session_id') or '')))})
+    except Exception as e:
+        logger.error(f"问一问失败: {e}\n{traceback.format_exc()}")
+        return JsonResponse({'status': 'error', 'message': str(e)}, status=400)
 
 
 def selection_last_api(request):

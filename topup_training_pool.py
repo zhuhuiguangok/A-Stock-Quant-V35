@@ -118,6 +118,14 @@ def main(start_after: str | None = None) -> None:
     for m in months:
         snap = _retry(lambda: pro.daily_basic(ts_code="", trade_date=f"{m}01", fields=BASIC_FIELDS),
                       tries=3, wait=1.0, label=f"daily_basic {m}月初")
+        if snap is None:
+            # 月初可能是节假日(如10月1日国庆)无数据——回退到该月第一个有数据的交易日
+            cal_m = pro.trade_cal(exchange="SSE", start_date=f"{m}01", end_date=f"{m}31", is_open="1")
+            for dd in sorted(cal_m[cal_m["is_open"] == 1]["cal_date"].astype(str)):
+                snap = _retry(lambda d2=dd: pro.daily_basic(ts_code="", trade_date=d2, fields=BASIC_FIELDS),
+                              tries=2, wait=1.0, label=f"daily_basic {m}回退{dd}")
+                if snap is not None:
+                    break
         if snap is not None:
             snap = snap[snap["ts_code"].isin(codes)].drop_duplicates("ts_code")
             snap["trade_date"] = snap["trade_date"].astype(str).str.zfill(8)
