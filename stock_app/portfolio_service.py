@@ -281,7 +281,10 @@ def sell_holding(
     )
     current_shares = int(holding.shares or 0)
     sell_shares = int(shares or current_shares)
-    sell_shares = min(current_shares, max(0, sell_shares // 100 * 100))
+    # 交易所规则：卖出须为100股整数倍；例外=一次性清掉含零股的全部持仓
+    if sell_shares != current_shares and sell_shares % 100 != 0:
+        raise ValueError("卖出股数须为100股整数倍（清仓可卖出全部持仓）")
+    sell_shares = min(current_shares, max(0, sell_shares))
     if sell_shares <= 0:
         raise ValueError("卖出股数必须至少100股，且不能超过当前持仓")
 

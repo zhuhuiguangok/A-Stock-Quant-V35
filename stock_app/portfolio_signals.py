@@ -39,7 +39,7 @@ def build_signals() -> dict:
     from .models import PortfolioHolding
 
     account = get_default_account()
-    holdings = list(PortfolioHolding.objects.filter(account=account))
+    holdings = list(PortfolioHolding.objects.filter(account=account, status="holding"))
     result: Dict = {"holdings": [], "advice": [], "cycle": {}, "generated_at": None}
 
     # ── 周期建议仓位 ──

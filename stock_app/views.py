@@ -3854,27 +3854,32 @@ def _run_analysis_task(task_id, raw_body):
                 result = {'status': 'error', 'message': '用户取消了本次分析'}
         if success:
             # 持久化最近一次选股结果：页面刷新/重开后回显，并标注分析时间
-            try:
-                cache_dir = str(_PROJECT_DATA_CACHE)
-                os.makedirs(cache_dir, exist_ok=True)
-                payload = {
-                    'saved_at': datetime.now().isoformat(timespec='seconds'),
-                    'result': _make_json_serializable(result),
-                }
-                (_Path(cache_dir) / 'last_selection.json').write_text(
-                    json.dumps(payload, ensure_ascii=False), encoding='utf-8')
-            except Exception as persist_exc:
-                logger.warning(f"保存最近选股结果失败（不影响分析结果）: {persist_exc}")
-            # 成绩单落库（选股跟踪回测的数据源，失败不影响主流程）
-            try:
-                from .selection_scorecard import record_selection_run
+            # 守卫：空结果（如测试环境/无数据日）不得覆盖有效的历史选股
+            _has_picks = bool(result.get('trend_stocks') or result.get('bottom_stocks'))
+            if _has_picks and result.get('data_date'):
                 try:
-                    _pool = str((json.loads(raw_body) or {}).get('stock_pool') or '')
-                except Exception:
-                    _pool = ''
-                record_selection_run(_make_json_serializable(result), pool=_pool)
-            except Exception as score_exc:
-                logger.warning(f"成绩单落库失败（不影响分析结果）: {score_exc}")
+                    cache_dir = str(_PROJECT_DATA_CACHE)
+                    os.makedirs(cache_dir, exist_ok=True)
+                    payload = {
+                        'saved_at': datetime.now().isoformat(timespec='seconds'),
+                        'result': _make_json_serializable(result),
+                    }
+                    (_Path(cache_dir) / 'last_selection.json').write_text(
+                        json.dumps(payload, ensure_ascii=False), encoding='utf-8')
+                except Exception as persist_exc:
+                    logger.warning(f"保存最近选股结果失败（不影响分析结果）: {persist_exc}")
+                # 成绩单落库（选股跟踪回测的数据源，失败不影响主流程）
+                try:
+                    from .selection_scorecard import record_selection_run
+                    try:
+                        _pool = str((json.loads(raw_body) or {}).get('stock_pool') or '')
+                    except Exception:
+                        _pool = ''
+                    record_selection_run(_make_json_serializable(result), pool=_pool)
+                except Exception as score_exc:
+                    logger.warning(f"成绩单落库失败（不影响分析结果）: {score_exc}")
+            else:
+                logger.warning("跳过持久化：本次选股结果为空（避免覆盖有效历史）")
         with _analysis_tasks_lock:
             _analysis_tasks[task_id].update({
                 'state': 'cancelled' if cancelled else ('completed' if success else 'failed'),
