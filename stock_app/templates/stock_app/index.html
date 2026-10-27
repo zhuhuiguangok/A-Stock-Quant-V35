@@ -4898,7 +4898,7 @@
         <div class="card-footer">
             <div class="type-tag ${type}">${typeLabel}</div>
             <div class="${posTagCls}"><i class="fas fa-balance-scale"></i> ${posAdvice}</div>
-            <button class="add-holding-btn" onclick="event.stopPropagation(); openStockQA('${s.ts_code||s.code||''}','${(s.name||'').replace(/'/g,'')}')" title="问一问这只票"
+            <button class="add-holding-btn" onclick="event.stopPropagation(); openStockQA('${s.ts_code||s.code||''}','${encodeURIComponent(s.name||'')}')" title="问一问这只票"
                     style="background:rgba(0,212,170,.12);border:1px solid rgba(0,212,170,.3);color:var(--teal)">
                 <i class="fas fa-robot"></i> 问一问
             </button>
@@ -6404,7 +6404,7 @@
                     <td style="padding:8px 6px">${h['现价'] ?? '-'}</td>
                     <td style="padding:8px 6px;color:${pnlColor}">${pnl == null ? '-' : pnl + '%'}</td>
                     <td style="padding:8px 6px">${sigBadge}</td>
-                    <td style="padding:8px 6px"><button class="mini-btn" onclick="openStockQA('${h.code}','${(h.name||'').replace(/'/g,'')}')">问</button></td>
+                    <td style="padding:8px 6px"><button class="mini-btn" onclick="openStockQA('${h.code}','${encodeURIComponent(h.name||'')}')">问</button></td>
                 </tr>`;
             }).join('');
             el.innerHTML = `
@@ -6423,10 +6423,12 @@
 
     /* ── 问一问抽屉 ── */
     let _qaSession = '';
+    let _qaCode = '';
     function openStockQA(code, name) {
         if (!code) { showToast('提示', '缺少股票代码', 'error'); return; }
         _qaCode = code;
-        document.getElementById('qaStockLabel').textContent = `${name || ''} (${code})`;
+        let _nm = name; try { _nm = decodeURIComponent(name); } catch(e) {}
+        document.getElementById('qaStockLabel').textContent = `${_nm || ''} (${code})`;
         document.getElementById('qaChat').innerHTML = '';
         document.getElementById('qaDrawer').style.display = 'flex';
         _qaSession = '';

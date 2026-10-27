@@ -130,17 +130,21 @@ def _selection_signal(code: str) -> dict:
 
 
 def _sector_view(industry: str) -> dict:
+    from .industry_map import to_sw_industry
+
     out = {"行业": industry or "未知"}
     sf = _read_json(SECTOR_FORECAST_PATH)
+    sw = to_sw_industry(industry)
     for p in sf.get("gbm_picks") or []:
-        if p.get("sector") == industry:
+        if p.get("sector") in (sw, industry):
             out["板块预测p_up"] = p.get("p_up")
             break
     ff = _read_json(FUND_FLOW_PATH)
-    for r in (ff.get("top_inflow") or ff.get("rows") or []):
-        if (r.get("sector_name") or r.get("name")) == industry:
-            out["行业主力净流入"] = r.get("main_force_net")
-            break
+    for list_key in ("top_inflow", "top_outflow", "rows"):
+        for r in ff.get(list_key) or []:
+            if isinstance(r, dict) and (r.get("sector_name") or r.get("name")) in (industry, sw):
+                out["行业主力净流入"] = r.get("main_force_net")
+                break
     return out
 
 
@@ -208,7 +212,7 @@ def collect_context(code: str) -> dict:
         "行情": quote or {"名称": code, "现价": None},
         "技术面": _technicals(code),
         "选股信号": _selection_signal(code),
-        "板块": _sector_view(industry or (quote.get("名称") and "")),
+        "板块": _sector_view(industry),
         "研报情绪": _research_view(code),
         "持仓状态": _holding_view(code),
         "大盘周期": (lambda c: {"日期": c.get("date"), "温度": c.get("cycle_score"),

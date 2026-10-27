@@ -58,15 +58,24 @@ def record_selection_run(result: dict, pool: str = "") -> Optional[int]:
 
 
 def backfill_from_last_selection() -> int:
-    """冷启动：把持久化的最近一次选股导入成绩单（幂等）。"""
+    """冷启动：把持久化的最近一次选股导入成绩单（幂等）。
+
+    同一 data_date 已存在任意池的 run 时跳过——防止与正式钩子记录的
+    run 形成"同日双胞胎"双重计入统计。
+    """
     try:
         if not LAST_SELECTION_PATH.exists():
             return 0
         payload = json.loads(LAST_SELECTION_PATH.read_text("utf-8"))
         result = payload.get("result") or {}
-        if not result:
+        data_date = str(result.get("data_date") or "").replace("-", "")[:8]
+        if not data_date:
             return 0
-        rid = record_selection_run(result, pool="all")
+        from .models import SelectionRun
+
+        if SelectionRun.objects.filter(data_date=data_date).exists():
+            return 0
+        rid = record_selection_run(result, pool="backfill")
         return 1 if rid else 0
     except Exception as exc:
         logger.warning(f"成绩单回填失败: {exc}")

@@ -65,17 +65,20 @@ def build_signals() -> dict:
                 pick_map.setdefault(code, {"bucket": bucket, "buy_score": s.get("buy_score"),
                                            "industry": s.get("industry"), "name": s.get("name"),
                                            "data_date": sel.get("data_date")})
-    # 板块预测 p_up
+    # 板块预测 p_up（申万一级口径，经行业映射匹配）
+    from .industry_map import to_sw_industry
+
     sf = _read_json(SECTOR_FORECAST_PATH)
     sector_pup = {p.get("sector"): p.get("p_up") for p in (sf.get("gbm_picks") or [])}
-    # 板块资金流
+    # 板块资金流（净流入榜 + 净流出榜都纳入，未上榜的行业无该字段）
     ff = _read_json(FUND_FLOW_PATH)
-    ff_rows = ff.get("top_inflow") or ff.get("rows") or []
     industry_flow = {}
-    for r in ff_rows if isinstance(ff_rows, list) else []:
-        name = r.get("sector_name") or r.get("name")
-        if name:
-            industry_flow[str(name)] = r.get("main_force_net")
+    for list_key in ("top_inflow", "top_outflow", "rows"):
+        for r in ff.get(list_key) or []:
+            if isinstance(r, dict):
+                name = r.get("sector_name") or r.get("name")
+                if name:
+                    industry_flow[str(name)] = r.get("main_force_net")
 
     total_mv = 0.0
     rows: List[dict] = []
@@ -100,6 +103,7 @@ def build_signals() -> dict:
         mv = float(ser.get("market_value") or 0)
         total_mv += mv
         ind = h.industry or (info or {}).get("industry") or ""
+        sw_ind = to_sw_industry(ind) or ind
         display_name = h.name or (info or {}).get("name") or h.code
         rows.append({
             "code": h.code,
@@ -112,12 +116,14 @@ def build_signals() -> dict:
             "盈亏率": ser.get("pnl_pct"),
             "选股信号": ({"档位": info["bucket"], "买点": info.get("buy_score"),
                         "数据日": info.get("data_date")} if info else None),
-            "板块预测p_up": sector_pup.get(ind),
-            "行业主力净流入": industry_flow.get(ind),
+            "板块预测p_up": sector_pup.get(sw_ind),
+            "行业主力净流入": industry_flow.get(ind, industry_flow.get(sw_ind)),
         })
 
     result["holdings"] = rows
-    result["generated_at"] = __import__("datetime").datetime.now().isoformat(timespec="minutes")
+    from datetime import datetime as _dt
+
+    result["generated_at"] = _dt.now().isoformat(timespec="minutes")
 
     # ── 大白话建议 ──
     advice: List[str] = []
