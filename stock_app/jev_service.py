@@ -1,23 +1,13 @@
 # -*- coding: utf-8 -*-
-"""Jev 易术 AI 预判模块。
+"""市场数据缓存与特征层（原 Jev 易术模块的数据部分）。
 
-两个预判任务（LLM 供应商可配置，OpenAI 兼容格式）：
-  A. 大盘明日上涨概率（市场数据 + 天干地支/五行/八卦 → p_up）
-  B. 概念/行业板块买入价值与持续性概率
+2026-10-28 起 Jev(TypeSafe) LLM 预测层已下线（区域封锁 451 + 验证无超额）。
+本模块保留为全平台共享的数据基础设施：
+  - 指数/辅助指数/两融/宽度/隔夜缺口/涨停池/FRED 序列的缓存加载（带过期自愈）
+  - 技术信号、v2~v10 市场特征（GBM 与 DeepSeek 次要视角的输入）
+  - 干支/五行/八卦确定性推导与交易日历（DeepSeek 上下文继续使用）
 
-供应商：
-  默认使用平台已验证的 DeepSeek（https://api.deepseek.com, deepseek-chat）。
-  拿到 Jev 地址后设置环境变量即可切换，无需改代码：
-      JEV_API_BASE=https://<jev域名>      JEV_API_KEY=apikey_xxx
-      JEV_MODEL=<模型名>
-
-样本不穿越保证（防未来函数）：
-  - 预测 T+1 时，提示词只允许包含交易日 ≤ T 的数据（_slice_as_of 强制截断）；
-  - 干支/五行/卦象由公历日期确定性推导（T+1 的日期是已知的日历事实，非未来数据）；
-  - 验证采用 walk-forward：逐日滚动，每天只用截至当日的信息生成预测，
-    再与 T+1 真实涨跌比对；内/外样本按时间前 2/3 与后 1/3 切分仅用于报告漂移。
-
-持久化：data_cache/jev/ 下的 predictions.jsonl（追加式）与 report_*.json。
+消费方：forecast_service（GBM 主信号 + DeepSeek）、sector_forecast_service。
 """
 from __future__ import annotations
 
@@ -38,7 +28,6 @@ _HEADERS = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 JEV_DIR = PROJECT_ROOT / "data_cache" / "jev"
-PREDICTIONS_PATH = JEV_DIR / "predictions.jsonl"
 
 # ── 供应商配置：TypeSafe「系统一」(jev-latest) 原生格式 ────────────────
 # 端点 POST {base}/v1/systemone，Bearer 认证，非 OpenAI 兼容：
@@ -58,15 +47,6 @@ def _load_legacy_env(key: str) -> str:
     return ""
 
 
-def get_provider() -> Dict[str, str]:
-    base = os.environ.get("JEV_API_BASE", "") or _load_legacy_env("JEV_API_BASE") \
-        or "https://api.typesafe.ai"
-    key = os.environ.get("JEV_API_KEY", "") or _load_legacy_env("JEV_API_KEY")
-    model = os.environ.get("JEV_MODEL", "") or _load_legacy_env("JEV_MODEL") or "jev-latest"
-    kind = "systemone" if "typesafe" in base.lower() else "openai"
-    return {"base": base.rstrip("/"), "key": key, "model": model, "kind": kind}
-
-
 def _sanitize_state(obj):
     """NaN/Inf → None，保证 state 可被严格 JSON 序列化（服务端拒绝 NaN 字面量）。"""
     if isinstance(obj, dict):
@@ -84,27 +64,8 @@ def _sanitize_state(obj):
     return obj
 
 
-def _systemone_ask(state: Dict, questions: Dict) -> Optional[Dict]:
-    """TypeSafe systemone 原生调用 → answers 字典。失败返回 None。"""
-    p = get_provider()
-    if not p["key"]:
-        logger.warning("Jev预判: 未配置 JEV_API_KEY")
-        return None
-    try:
-        with httpx.Client(timeout=90.0, trust_env=False) as client:
-            r = client.post(f"{p['base']}/v1/systemone",
-                            headers={"Authorization": f"Bearer {p['key']}"},
-                            json={"model": p["model"],
-                                  "state": _sanitize_state(state),
-                                  "questions": questions})
-            r.raise_for_status()
-            data = r.json()
-            return data.get("answers") or {}
-    except Exception as exc:
-        logger.warning(f"Jev预判: systemone调用失败（{p['base']}/{p['model']}）: {exc}")
-        return None
-
-
+# 连续失败熔断：TypeSafe 区域封锁(451)等场景下，服务端要 20+ 秒才慢速拒绝，
+# 每次预测白等多轮。连续失败后 10 分钟内直接跳过 LLM 调用。
 # ═══════════════════════════════════════════════════════════════════
 # 干支 / 五行 / 八卦（确定性推导，纯公历日期输入）
 # ═══════════════════════════════════════════════════════════════════
@@ -228,34 +189,6 @@ ZT_CACHE = JEV_DIR / "zt_pool_history.json"
 FEATV = 10  # 特征版本：v10=v8+易术数字化(节气/干支五行/阴阳) 进 GBM
 
 
-def _http_chat(prompt: str, json_mode: bool = True) -> Optional[str]:
-    p = get_provider()
-    if not p["key"]:
-        logger.warning("Jev预判: 未配置 API key（JEV_API_KEY/DEEPSEEK_API_KEY）")
-        return None
-    body = {
-        "model": p["model"],
-        "messages": [
-            {"role": "system", "content": "你是严谨的量化分析师，兼通易术象数。只输出合法 JSON，不要解释。"},
-            {"role": "user", "content": prompt},
-        ],
-        "temperature": 0.2,
-        "max_tokens": 900,
-    }
-    if json_mode:
-        body["response_format"] = {"type": "json_object"}
-    try:
-        with httpx.Client(timeout=90.0, trust_env=False) as client:
-            r = client.post(f"{p['base']}/chat/completions",
-                            headers={"Authorization": f"Bearer {p['key']}"},
-                            json=body)
-            r.raise_for_status()
-            return r.json()["choices"][0]["message"]["content"]
-    except Exception as exc:
-        logger.warning(f"Jev预判: LLM调用失败（{p['base']}/{p['model']}）: {exc}")
-        return None
-
-
 def _parse_json(text: Optional[str]) -> Optional[Dict]:
     if not text:
         return None
@@ -367,17 +300,6 @@ def _next_trading_day(after: _date) -> _date:
             return d
         d += timedelta(days=1)
     return after + timedelta(days=1)
-
-
-def predict_index_next() -> Optional[Dict]:
-    """预测"下一个交易日"（自动跳过周末节假日，指数缓存强制刷新）。"""
-    rows = _load_index_closes(force=True)
-    if not rows:
-        return None
-    latest = max(d for d, _ in rows)
-    y, m, dd = int(latest[:4]), int(latest[4:6]), int(latest[6:8])
-    target = _next_trading_day(_date(y, m, dd))
-    return predict_index(target)
 
 
 def _fetch_index_from_tushare(days: int = 4300) -> List[Tuple[str, float]]:
@@ -1007,236 +929,9 @@ def np_std(xs):
 # ═══════════════════════════════════════════════════════════════════
 # 任务 A：大盘明日涨跌概率
 # ═══════════════════════════════════════════════════════════════════
-def predict_index(target_date: _date) -> Optional[Dict]:
-    """预测 target_date 当日上证涨跌。使用 ≤ target_date-1 的 v5 特征（无穿越）。"""
-    as_of = target_date - timedelta(days=1)
-    feats = _market_features_v5(as_of)
-    if not feats:
-        logger.warning("Jev预判: 指数数据不足")
-        return None
-    yiji = yiji_context(target_date)
-    p = get_provider()
-    rec = {
-        "kind": "index", "target_date": target_date.isoformat(),
-        "as_of": as_of.isoformat(), "provider": p["model"],
-        "featv": FEATV,
-        "features": feats, "yiji": yiji,
-    }
-
-    if p["kind"] == "systemone":
-        state = {"market": feats, "yiji": yiji, "target_date": target_date.isoformat()}
-        answers = _systemone_ask(state, {
-            "up_tomorrow": {
-                "type": "choice",
-                "question": ("Quant + Yijing metaphysics view: will the Shanghai index "
-                             f"CLOSE UP on {target_date.isoformat()}? Weigh momentum, "
-                             "volatility and the day-pillar five-element relations and hexagram imagery."),
-                "criteria": {
-                    "UP": "index closes higher than previous close",
-                    "DOWN": "index closes lower than previous close",
-                },
-            },
-            "conviction": {
-                "type": "choice",
-                "question": "How strong is your conviction in the direction above?",
-                "criteria": {
-                    "high": "clear signal, would act on it",
-                    "medium": "signal present but noisy",
-                    "low": "coin-flip territory",
-                },
-            },
-        })
-        if not answers or "up_tomorrow" not in answers:
-            return None
-        a = answers["up_tomorrow"]
-        probs = a.get("probabilities") or {}
-        rec["p_up"] = _clamp01(probs.get("UP", 0.0))
-        rec["direction"] = "up" if a.get("choice") == "UP" else "down"
-        conv = (answers.get("conviction") or {}).get("choice")
-        rec["conviction"] = {"high": 0.85, "medium": 0.55, "low": 0.3}.get(conv, 0.5)
-        rec["reason"] = f"[系统一结构化决策] choice={a.get('choice')} confidence={a.get('confidence')}"
-        _append_prediction(rec)
-        return rec
-
-    # DeepSeek 等 OpenAI 兼容文本模型（v3 提示词：具名信号+基准锚定）
-    base_up = feats.get("历史基准涨概率%")
-    prompt = (
-        "任务：预测上证指数在目标交易日的上涨概率 p_up。\n"
-        f"目标交易日：{target_date.isoformat()}\n\n"
-        f"【计算公式信号（截至 {as_of.isoformat()} 收盘，绝无未来数据）】\n"
-        f"{json.dumps(feats, ensure_ascii=False)}\n\n"
-        "【目标日的干支五行卦象（辅助维度，权重应低于量化信号）】\n"
-        f"{json.dumps(yiji, ensure_ascii=False)}\n\n"
-        f"【重要锚定】历史上该指数约 {base_up}% 的交易日上涨。"
-        "没有强信号时 p_up 应贴近该基准，只有在多项信号同向时才显著偏离。\n"
-        "输出 JSON：\n"
-        '{"p_up": 0~1, "edge": "偏离基准的原因(无偏离写 none)", '
-        '"reason": "60字内：RSI/MACD/均线/量能各一句+易术一句"}'
-    )
-    out = _parse_json(_http_chat(prompt))
-    if not out or "p_up" not in out:
-        return None
-    rec.update({
-        "p_up": _clamp01(out.get("p_up")), "direction": out.get("direction"),
-        "conviction": _clamp01(out.get("conviction")), "reason": str(out.get("reason", ""))[:200],
-    })
-    _append_prediction(rec)
-    return rec
-
-
-# ═══════════════════════════════════════════════════════════════════
-# 任务 B：板块买入价值 + 持续性概率
-# ═══════════════════════════════════════════════════════════════════
-def predict_sectors(target_date: _date, top_n: int = 8) -> Optional[Dict]:
-    """对行业板块给出买入价值与持续性。使用 ≤ target_date-1 的板块资金流（无穿越）。"""
-    sectors = _sector_snapshot(target_date)
-    if not sectors:
-        logger.warning("Jev预判: 板块资金流缓存不足")
-        return None
-    yiji = yiji_context(target_date)
-    p = get_provider()
-    sec_map = {s["sector"]: s for s in sectors}
-
-    if p["kind"] == "systemone":
-        # 批量类型化问题：每板块"值得买吗"+"动能会持续吗"，一次调用全出
-        questions = {}
-        for s in sectors[:12]:
-            name = s["sector"]
-            questions[f"buy::{name}"] = {
-                "type": "choice",
-                "question": f"Considering the 5-day main-force net inflow ({s['net_5d_yi']}亿) "
-                            f"and Yijing day-pillar context, is {name} worth buying next session?",
-                "criteria": {"buy": "worth buying", "pass": "not attractive"},
-            }
-            questions[f"persist::{name}"] = {
-                "type": "choice",
-                "question": f"Will the net inflow into {name} CONTINUE over the next 3 sessions?",
-                "criteria": {"sustain": "inflow continues", "fade": "momentum fades"},
-            }
-        answers = _systemone_ask(
-            {"sector_flows": sectors[:12], "yiji": yiji, "target_date": target_date.isoformat()},
-            questions)
-        if not answers:
-            return None
-        picks, avoid, pass_scores = [], [], {}
-        for key, a in answers.items():
-            kind, _, name = key.partition("::")
-            probs = a.get("probabilities") or {}
-            if kind == "buy":
-                score = _clamp01(probs.get("buy", 0.0))
-                if name not in sec_map:
-                    continue
-                if a.get("choice") == "buy" and score >= 0.5:
-                    picks.append({"sector": name, "persistence": 0.0,
-                                  "reason": f"买入概率{score:.0%}", "_buy": score})
-                else:
-                    pass_scores[name] = score
-                    avoid.append(name)
-            elif kind == "persist":
-                for pk in picks:
-                    if pk["sector"] == name:
-                        pk["persistence"] = _clamp01(probs.get("sustain", 0.0))
-        if not picks and pass_scores:
-            # 保守市况：无板块达 50% 买入阈值 → 给 buy 概率参考榜（明确标注未达标）
-            for name, sc in sorted(pass_scores.items(), key=lambda kv: -kv[1])[:5]:
-                picks.append({"sector": name, "persistence": 0.0,
-                              "reason": f"买入概率{sc:.0%}（未达50%阈值，仅供观察）", "_buy": sc})
-        picks = sorted(picks, key=lambda x: -x.get("_buy", 0))[:top_n]
-        rec = {
-            "kind": "sectors", "target_date": target_date.isoformat(),
-            "as_of": sectors[0].get("as_of", ""), "provider": p["model"],
-            "picks": picks, "avoid": avoid[:4], "yiji": yiji,
-        }
-        _append_prediction(rec)
-        return rec
-
-    # DeepSeek 等 OpenAI 兼容文本模型
-    prompt = (
-        "任务：从下列行业板块中选出最值得买入的板块并评估行情持续性。\n"
-        f"目标交易日：{target_date.isoformat()}\n\n"
-        "【板块资金流（近5日主力净额亿元，截至昨日，绝无未来数据）】\n"
-        f"{json.dumps(sectors[:20], ensure_ascii=False)}\n\n"
-        "【目标日的干支五行卦象】\n"
-        f"{json.dumps(yiji, ensure_ascii=False)}\n\n"
-        "结合资金动能与五行生克（如资金属水而日柱属土则受克承压），输出 JSON：\n"
-        '{"picks": [{"sector": "板块名", "persistence": 0~1 持续性概率, "reason": "40字内"}, '
-        f'"...最多{top_n}个"], "avoid": ["最不建议的2个板块"]}}'
-    )
-    out = _parse_json(_http_chat(prompt))
-    if not out or not out.get("picks"):
-        return None
-    known = {s["sector"] for s in sectors}
-    picks = [pk for pk in out["picks"] if isinstance(pk, dict) and pk.get("sector") in known][:top_n]
-    for pk in picks:
-        pk["persistence"] = _clamp01(pk.get("persistence"))
-    rec = {
-        "kind": "sectors", "target_date": target_date.isoformat(),
-        "as_of": sectors[0].get("as_of", ""), "provider": p["model"],
-        "picks": picks, "avoid": [str(a) for a in (out.get("avoid") or [])][:4],
-        "yiji": yiji,
-    }
-    _append_prediction(rec)
-    return rec
-
-
-def _sector_snapshot(as_of: _date) -> List[Dict]:
-    """从资金流缓存取 ≤ as_of 的最新一日板块净流入排名。"""
-    import pandas as pd
-
-    cache_dir = PROJECT_ROOT / "data_cache" / "bull_bear" / "cache"
-    cands = list(cache_dir.glob("fund_flow_sector*.parquet")) + list(cache_dir.glob("*sector*.parquet"))
-    frames = []
-    for p in cands:
-        try:
-            frames.append(pd.read_parquet(p))
-        except Exception:
-            continue
-    if not frames:
-        return []
-    df = pd.concat(frames, ignore_index=True)
-    df = df[pd.to_datetime(df["date"].astype(str), errors="coerce").notna()]
-    df["date"] = df["date"].astype(str)
-    df = df[df["date"] <= as_of.strftime("%Y%m%d")]
-    if df.empty:
-        return []
-    latest = df["date"].max()
-    day = df[df["date"] == latest]
-    if "main_force_net" not in day.columns:
-        return []
-    g = day.groupby("sector_name")["main_force_net"].sum().sort_values(ascending=False)
-    out = [{"sector": k, "net_5d_yi": round(float(v) / 1e8, 2), "as_of": latest}
-           for k, v in g.head(20).items()]
-    return out
-
-
 # ═══════════════════════════════════════════════════════════════════
 # 持久化与回填
 # ═══════════════════════════════════════════════════════════════════
-def _append_prediction(rec: Dict) -> None:
-    """追加预测记录；同 kind+目标日+模型+特征版本 已存在时跳过。"""
-    JEV_DIR.mkdir(parents=True, exist_ok=True)
-    for old in _load_predictions():
-        if (old.get("kind") == rec.get("kind")
-                and old.get("target_date") == rec.get("target_date")
-                and old.get("provider") == rec.get("provider")
-                and old.get("featv") == rec.get("featv")):
-            return
-    with open(PREDICTIONS_PATH, "a", encoding="utf-8") as fh:
-        fh.write(json.dumps(rec, ensure_ascii=False) + "\n")
-
-
-def _load_predictions() -> List[Dict]:
-    if not PREDICTIONS_PATH.exists():
-        return []
-    out = []
-    for line in PREDICTIONS_PATH.read_text("utf-8").splitlines():
-        try:
-            out.append(json.loads(line))
-        except json.JSONDecodeError:
-            continue
-    return out
-
-
 def _clamp01(v) -> float:
     try:
         return max(0.0, min(1.0, float(v)))
@@ -1244,134 +939,3 @@ def _clamp01(v) -> float:
         return 0.5
 
 
-# ═══════════════════════════════════════════════════════════════════
-# Walk-forward 验证（样本不穿越 + 内外样本报告）
-# ═══════════════════════════════════════════════════════════════════
-def validate(days: int = 30) -> Dict:
-    """逐日 walk-forward：每天用 ≤T 数据预测 T+1，与真实涨跌比对。
-
-    优化：已预测过的日期直接复用历史记录（不重复扣 LLM 调用），增量补算新日期。
-    内样本 = 评估窗前 2/3；外样本 = 后 1/3（检验提示词同分布假设是否漂移）。
-    """
-    rows = _load_index_closes()
-    if len(rows) < days + 6:
-        days = max(5, len(rows) - 6)
-    date_list = [d for d, _ in rows[-(days + 1):]]
-    reused = {(p.get("target_date"), p.get("provider")): p
-              for p in _load_predictions()
-              if p.get("kind") == "index" and p.get("featv") == FEATV
-              and p.get("provider") == get_provider()["model"]}
-    model = get_provider()["model"]
-    results, fresh_calls = [], 0
-    for i in range(len(date_list) - 1):
-        t = _date.fromisoformat(f"{date_list[i][:4]}-{date_list[i][4:6]}-{date_list[i][6:]}")
-        t1 = _date.fromisoformat(f"{date_list[i+1][:4]}-{date_list[i+1][4:6]}-{date_list[i+1][6:]}")
-        rec = reused.get((t1.isoformat(), model))
-        if rec and "p_up" in rec:
-            pass  # 复用历史预测，不再扣调用
-        else:
-            rec = predict_index(t1)
-            fresh_calls += 1
-        if not rec:
-            continue
-        c_t = dict(rows)[date_list[i]]
-        c_t1 = dict(rows)[date_list[i + 1]]
-        actual_up = c_t1 > c_t
-        results.append({
-            "target_date": t1.isoformat(), "p_up": rec["p_up"],
-            "actual_up": actual_up, "correct": (rec["p_up"] > 0.5) == actual_up,
-        })
-    if not results:
-        return {"status": "failed", "message": "无可用预测样本"}
-
-    split = int(len(results) * 2 / 3)
-    in_s, out_s = results[:split], results[split:]
-
-    def _stats(seg):
-        n = len(seg)
-        acc = sum(r["correct"] for r in seg) / n if n else 0.0
-        brier = sum((r["p_up"] - (1 if r["actual_up"] else 0)) ** 2 for r in seg) / n if n else 0.0
-        base = sum(r["actual_up"] for r in seg) / n if n else 0.0
-        buckets = {}
-        for r in seg:
-            k = min(4, int(r["p_up"] * 5))
-            buckets.setdefault(k, []).append(r["actual_up"])
-        calib = {f"{k*20}-{k*20+20}%": round(sum(v)/len(v), 3) for k, v in sorted(buckets.items()) if v}
-        return {"n": n, "accuracy": round(acc, 3), "brier": round(brier, 3),
-                "base_rate_up": round(base, 3), "edge": round(acc - base, 3),
-                "calibration": calib}
-
-    report = {
-        "status": "success", "days": days, "provider": model,
-        "generated_at": datetime.now().isoformat(timespec="seconds"),
-        "fresh_llm_calls": fresh_calls,
-        "overall": _stats(results),
-        "in_sample": _stats(in_s), "out_sample": _stats(out_s) if out_s else None,
-        "sector_validation": validate_sectors(days),
-        "detail": results[-10:],
-    }
-    JEV_DIR.mkdir(parents=True, exist_ok=True)
-    (JEV_DIR / f"report_index_{datetime.now().strftime('%Y%m%d_%H%M')}.json").write_text(
-        json.dumps(report, ensure_ascii=False, indent=1), encoding="utf-8")
-    return report
-
-
-def validate_sectors(days: int = 20) -> Optional[Dict]:
-    """板块推荐持续性验证：pick 的 persistence 是否兑现为后续3日真净流入。
-
-    实际持续 = 该板块之后 3 个交易日的主力净额合计 > 0（用资金流缓存，无未来函数：
-    只比对 as_of 之后的已实现数据）。分桶报告高/中持续性组的兑现率。
-    """
-    import pandas as pd
-
-    picks_all = [p for p in _load_predictions()
-                 if p.get("kind") == "sectors" and p.get("as_of")]
-    if not picks_all:
-        return None
-    cache_dir = PROJECT_ROOT / "data_cache" / "bull_bear" / "cache"
-    frames = []
-    for p in cache_dir.glob("*sector*.parquet"):
-        try:
-            frames.append(pd.read_parquet(p))
-        except Exception:
-            continue
-    if not frames:
-        return None
-    df = pd.concat(frames, ignore_index=True)
-    df["date"] = df["date"].astype(str)
-    df = df[pd.to_datetime(df["date"], errors="coerce").notna()]
-    dates = sorted(df["date"].unique())
-    date_pos = {d: i for i, d in enumerate(dates)}
-
-    rows, hit_hi = [], []
-    for rec in picks_all[-days:]:
-        as_of = str(rec.get("as_of", ""))[:8].replace("-", "")
-        if as_of not in date_pos:
-            continue
-        future = dates[date_pos[as_of] + 1: date_pos[as_of] + 4]  # 之后3个交易日
-        if not future:
-            continue
-        for pick in rec.get("picks") or []:
-            sector = pick.get("sector")
-            sub = df[(df["sector_name"] == sector) & (df["date"].isin(future))]
-            if sub.empty or "main_force_net" not in sub.columns:
-                continue
-            actual_continue = float(sub["main_force_net"].sum()) > 0
-            persistence = float(pick.get("persistence") or 0)
-            hit = (persistence >= 0.5) == actual_continue if persistence >= 0.4 else None
-            rows.append({"as_of": as_of, "sector": sector, "persistence": persistence,
-                         "actual_continue": actual_continue})
-            if persistence >= 0.6:
-                hit_hi.append(1 if actual_continue else 0)
-
-    if not rows:
-        return None
-    n = len(rows)
-    hi_n = len(hit_hi)
-    hi_rate = sum(hit_hi) / hi_n if hi_n else None
-    return {
-        "n": n, "high_persist_n": hi_n,
-        "high_persist_continue_rate": round(hi_rate, 3) if hi_rate is not None else None,
-        "mean_persistence": round(sum(r["persistence"] for r in rows) / n, 3),
-        "note": "高持续性(≥0.6)组的后续3日真净流入兑现率",
-    }

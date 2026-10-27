@@ -1,4 +1,4 @@
-"""Jev 易术预判模块回归测试。"""
+"""市场数据层回归测试（Jev LLM 预测层 2026-10-28 已下线，此文件锁数据层行为）。"""
 import json
 from datetime import date
 from unittest import mock
@@ -51,15 +51,3 @@ class ParseAndMetricsTest(SimpleTestCase):
         self.assertEqual(js._clamp01(1.7), 1.0)
         self.assertEqual(js._clamp01(-3), 0.0)
         self.assertEqual(js._clamp01("bad"), 0.5)
-
-    def test_validate_metrics_on_mock(self):
-        """mock LLM 恒返回 p_up=0.6 → 准确率/Brier/结构可计算。"""
-        fixed = {"p_up": 0.6, "direction": "up", "conviction": 0.5, "reason": "mock"}
-        with mock.patch.object(js, "_load_index_closes", return_value=[
-                (f"202601{i:02d}", 3000 + i * 10) for i in range(1, 21)]), \
-             mock.patch.object(js, "predict_index", return_value=fixed):
-            report = js.validate(days=10)
-        self.assertEqual(report["status"], "success")
-        self.assertGreaterEqual(report["overall"]["n"], 5)
-        self.assertIn("accuracy", report["overall"])
-        self.assertIn("out_sample", report)

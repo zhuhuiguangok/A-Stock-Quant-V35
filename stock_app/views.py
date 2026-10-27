@@ -3919,6 +3919,20 @@ def start_analysis_task(request):
     except (TypeError, ValueError):
         return JsonResponse({'status': 'error', 'message': '请求 JSON 无效'}, status=400)
 
+    # 参数校验：非法参数直接拒绝，不启动后台任务（避免空跑占资源）
+    try:
+        _params = json.loads(raw_body) or {}
+        _max = int(_params.get('max_stocks', 60))
+        _min = int(_params.get('min_score', 40))
+        if not (1 <= _max <= 300):
+            return JsonResponse({'status': 'error', 'message': 'max_stocks 须在 1-300 之间'}, status=400)
+        if not (0 <= _min <= 100):
+            return JsonResponse({'status': 'error', 'message': 'min_score 须在 0-100 之间'}, status=400)
+        if _params.get('stock_pool') not in (None, '', 'csi1000', 'csi2000', 'all'):
+            return JsonResponse({'status': 'error', 'message': 'stock_pool 仅支持 csi1000/csi2000/all'}, status=400)
+    except (TypeError, ValueError):
+        return JsonResponse({'status': 'error', 'message': 'max_stocks/min_score 须为整数'}, status=400)
+
     task_id = uuid.uuid4().hex
     now = time.time()
     with _analysis_tasks_lock:
@@ -4382,43 +4396,8 @@ def model_retrain_status_api(request):
 
 
 @csrf_exempt
-def jev_status_api(request):
-    """Jev易术预判：配置 + 最近预测记录。"""
-    try:
-        from .jev_service import get_provider, _load_predictions
-        p = get_provider()
-        preds = _load_predictions()
-        return JsonResponse({'status': 'success',
-                             'provider': {'base': p['base'], 'model': p['model'],
-                                          'has_key': bool(p['key'])},
-                             'predictions': preds[-30:]})
-    except Exception as e:
-        return JsonResponse({'status': 'error', 'message': str(e)}, status=400)
-
-
-@csrf_exempt
-def jev_predict_api(request):
-    """Jev易术预判：生成下一交易日大盘概率 + 板块买入/持续性（自动跳过节假日）。"""
-    if request.method != 'POST':
-        return JsonResponse({'status': 'error', 'message': '仅支持POST'}, status=405)
-    try:
-        from .jev_service import predict_index_next, predict_sectors, _load_index_closes
-        rows = _load_index_closes()
-        latest = max(d for d, _ in rows)
-        target = datetime.strptime(latest, '%Y%m%d').date()
-        idx = predict_index_next()
-        sec = predict_sectors(target)
-        return JsonResponse({'status': 'success',
-                             'target_date': idx.get('target_date') if idx else target.isoformat(),
-                             'index': idx, 'sectors': sec})
-    except Exception as e:
-        logger.error(f"Jev预判失败: {e}\n{traceback.format_exc()}")
-        return JsonResponse({'status': 'error', 'message': str(e)}, status=400)
-
-
-@csrf_exempt
 def sector_forecast_run_api(request):
-    """手动触发板块预测（GBM Top10 + Jev 语义化 Top10）。"""
+    """手动触发板块预测（GBM Top10）。"""
     if request.method != 'POST':
         return JsonResponse({'status': 'error', 'message': '仅支持POST'}, status=405)
     try:
@@ -4442,7 +4421,7 @@ def sector_forecast_status_api(request):
 
 @csrf_exempt
 def forecast_run_api(request):
-    """手动触发 AI 预测（GBM 主信号 + Jev/DeepSeek 次要视角）。"""
+    """手动触发 AI 预测（GBM 主信号 + DeepSeek 次要视角）。"""
     if request.method != 'POST':
         return JsonResponse({'status': 'error', 'message': '仅支持POST'}, status=405)
     try:
@@ -4460,21 +4439,6 @@ def forecast_status_api(request):
         return JsonResponse({'status': 'success', **_make_json_serializable(get_status())})
     except Exception as e:
         logger.error(f"AI预测状态读取失败: {e}")
-        return JsonResponse({'status': 'error', 'message': str(e)}, status=400)
-
-
-@csrf_exempt
-def jev_validate_api(request):
-    """Jev易术预判：walk-forward 样本内外验证（days 参数控制回看天数）。"""
-    if request.method != 'POST':
-        return JsonResponse({'status': 'error', 'message': '仅支持POST'}, status=405)
-    try:
-        body = json.loads(request.body or b'{}')
-        days = max(5, min(500, int(body.get('days') or 30)))
-        from .jev_service import validate
-        return JsonResponse({'status': 'success', 'report': _make_json_serializable(validate(days))})
-    except Exception as e:
-        logger.error(f"Jev验证失败: {e}\n{traceback.format_exc()}")
         return JsonResponse({'status': 'error', 'message': str(e)}, status=400)
 
 

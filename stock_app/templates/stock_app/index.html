@@ -1676,8 +1676,8 @@
     <button class="side-nav-btn" id="navGlobal" onclick="showWorkspacePage('global')" title="全球雷达">
         <i class="fas fa-earth-asia"></i><span>全球</span>
     </button>
-    <button class="side-nav-btn" id="navJev" onclick="showWorkspacePage('jev')" title="AI易术预判">
-        <i class="fas fa-yin-yang"></i><span>AI预判</span>
+    <button class="side-nav-btn" id="navJev" onclick="showWorkspacePage('jev')" title="AI预判">
+        <i class="fas fa-chart-line"></i><span>AI预判</span>
     </button>
     <button class="side-nav-btn" id="navExit" onclick="showWorkspacePage('exit')" title="持仓巡检">
         <i class="fas fa-heartbeat"></i><span>巡检</span>
@@ -2372,10 +2372,10 @@
         <div class="fund-flow-hero">
             <div>
                 <div class="fund-flow-kicker">AI FORECAST</div>
-                <div class="fund-flow-title"><i class="fas fa-yin-yang"></i> AI预判 · 市场方向三模型合议</div>
+                <div class="fund-flow-title"><i class="fas fa-chart-line"></i> AI预判 · 市场方向双模型合议</div>
                 <div class="fund-flow-sub">
-                    主信号 GBM（公式特征，全历史验证 +3.5% 超额）；次要视角 Jev（语义化标注输入）与 DeepSeek（量化+易术）。
-                    三模型并排展示，GBM 的「高置信出手」标记为决策参考。
+                    主信号 GBM（公式特征，全历史验证 +3.5% 超额）；次要视角 DeepSeek（量化+易术）。
+                    双模型并排展示，GBM 的「高置信出手」标记为决策参考。
                 </div>
             </div>
             <div class="fund-flow-actions">
@@ -2397,17 +2397,7 @@
             </div>
         </div>
 
-        <div style="display:grid;grid-template-columns:1fr 1fr;gap:14px;margin-bottom:14px">
-            <div class="fund-flow-card">
-                <div class="fund-flow-card-title" style="font-size:15px"><i class="fas fa-yin-yang"></i> Jev 次要视角 <span id="jevTarget" style="font-size:12px;color:var(--text3)"></span></div>
-                <div style="display:flex;gap:16px;align-items:center">
-                    <div style="text-align:center;min-width:90px">
-                        <div id="jevPUp" style="font-family:var(--mono);font-size:30px;font-weight:800;color:var(--gold)">--</div>
-                        <div style="font-size:11px;color:var(--text3)">p_up（语义化输入）</div>
-                    </div>
-                    <div id="jevInfo" style="flex:1;font-size:13px;line-height:1.8;color:var(--text2)">未生成</div>
-                </div>
-            </div>
+        <div style="margin-bottom:14px">
             <div class="fund-flow-card">
                 <div class="fund-flow-card-title" style="font-size:15px"><i class="fas fa-robot"></i> DeepSeek 次要视角 <span id="dsTarget" style="font-size:12px;color:var(--text3)"></span></div>
                 <div style="display:flex;gap:16px;align-items:center">
@@ -2424,15 +2414,9 @@
             <div class="fund-flow-card-title"><i class="fas fa-layer-group"></i> 板块预测 Top10 <span id="sectorTarget" style="font-size:13px;color:var(--text3)"></span>
                 <button class="btn-train" onclick="runSectorForecast()" id="sectorRunBtn" style="padding:8px 12px;margin-left:auto"><i class="fas fa-bolt"></i> 生成今日板块</button></div>
             <div id="sectorMeta" style="display:flex;gap:8px;flex-wrap:wrap;margin-bottom:12px"></div>
-            <div style="display:grid;grid-template-columns:1fr 1fr;gap:14px">
-                <div>
-                    <div style="font-size:13px;font-weight:700;color:var(--teal);margin-bottom:8px"><i class="fas fa-chart-line"></i> GBM 主视角（公式特征）</div>
-                    <div id="gbmSectorBox" class="fund-flow-list">尚未生成。</div>
-                </div>
-                <div>
-                    <div style="font-size:13px;font-weight:700;color:var(--gold);margin-bottom:8px"><i class="fas fa-yin-yang"></i> Jev 语义化视角（次要参考）</div>
-                    <div id="jevSectorBox" class="fund-flow-list">尚未生成。</div>
-                </div>
+            <div>
+                <div style="font-size:13px;font-weight:700;color:var(--teal);margin-bottom:8px"><i class="fas fa-chart-line"></i> GBM 主视角（公式特征）</div>
+                <div id="gbmSectorBox" class="fund-flow-list">尚未生成。</div>
             </div>
         </div>
 
@@ -2441,7 +2425,6 @@
             <div style="font-size:13px;line-height:2;color:var(--text2)">
                 <b style="color:var(--teal)">GBM</b> 全历史 2600 日：56.1% / +3.5% 超额 ｜ 熊段 +7.8% ｜ 选择性出手 +7.3%<br>
                 <b style="color:var(--teal)">板块 GBM</b> 250 日板块外样本：Top10 命中率 52.8% / +3.1% 超额（辅助参考位）<br>
-                <b style="color:var(--gold)">Jev-v13 语义化</b> 250 日：53.6% / -4.8%（次要视角，仅供对照）<br>
                 <b style="color:var(--purple)">DeepSeek</b> 250 日：52.8% / -5.6%（次要视角，仅供对照）
             </div>
         </div>
@@ -4554,7 +4537,7 @@
     }
 
     /* ═══ 渲染所有股票卡片 ═══ */
-    /* ═══ AI预判：GBM主信号 + Jev/DeepSeek次要视角 ═══ */
+    /* ═══ AI预判：GBM主信号 + DeepSeek次要视角 ═══ */
     function _pct(v) { return v === null || v === undefined ? '--' : (v * 100).toFixed(1) + '%'; }
     function _dir(d) { return d === 'up' ? '看涨 ↑' : d === 'down' ? '看跌 ↓' : '--'; }
     function _dirColor(d) { return d === 'up' ? 'var(--red)' : d === 'down' ? 'var(--green)' : 'var(--gold)'; }
@@ -4567,7 +4550,6 @@
             const t = d.task || {}, s = d.scheduler || {}, latest = d.latest || {};
             document.getElementById('forecastMeta').innerHTML =
                 _jevChip(`GBM 主信号`, true) +
-                _jevChip(`Jev-v13 语义化`, true) +
                 _jevChip(`DeepSeek 量化+易术`, true) +
                 _jevChip(s.enabled ? `每日 ${String(s.hour).padStart(2,'0')}:${String(s.minute).padStart(2,'0')} 自动` : '定时未启用', !!s.enabled) +
                 _jevChip(t.state === 'running' ? `运行中 ${t.progress}%` : (latest.target_date ? `信号 ${latest.target_date}` : '尚未运行'), true);
@@ -4594,12 +4576,9 @@
             document.getElementById('sectorTarget').textContent = td !== '--' ? `· 预测 ${td}` : '';
             document.getElementById('sectorMeta').innerHTML =
                 _jevChip(`GBM Top10 52.8%/+3.1%`, true) +
-                _jevChip(`Jev 语义化 Top10 51.1%/+1.4%`, true) +
                 _jevChip(d.scheduler?.enabled ? `每日 08:00 自动` : '定时未启用', !!d.scheduler?.enabled);
             const gb = latest.gbm_picks || [];
             document.getElementById('gbmSectorBox').innerHTML = gb.length ? gb.map((p, i) => _sectorRow(p, i)).join('') : '尚未生成。';
-            const jp = latest.jev_picks || [];
-            document.getElementById('jevSectorBox').innerHTML = jp.length ? jp.map((p, i) => _sectorRow(p, i)).join('') : '尚未生成。';
         } catch (e) { /* 静默 */ }
     }
 
@@ -4611,7 +4590,7 @@
             const res = await fetch(`${API_BASE}/sector-forecast/run/`, {method: 'POST'});
             const d = await res.json();
             if (d.status !== 'success') throw new Error(d.message || '启动失败');
-            showToast('板块预测已启动', 'GBM 重训 + Jev 语义化视角计算中');
+            showToast('板块预测已启动', 'GBM 重训计算中');
             const timer = setInterval(async () => {
                 const sres = await fetch(`${API_BASE}/sector-forecast/status/`, {cache: 'no-store'});
                 const sd = await sres.json();
@@ -4632,7 +4611,6 @@
 
     function renderForecast(latest) {
         const g = latest.gbm || {};
-        const j = latest.jev || {};
         const ds = latest.deepseek || {};
         const td = latest.target_date || '--';
         // GBM
@@ -4646,12 +4624,6 @@
             ? `方向 <b style="color:${_dirColor(g.direction)}">${_dir(g.direction)}</b> ｜ 置信 ${(g.confidence * 100).toFixed(0)}% ｜ 训练样本 ${g.train_n || '--'} 天<br>
                <span style="font-size:12px;color:var(--text3)">v5 特征 ${g.features_used || 21} 维 ｜ 历史验证：+3.5% 超额 / 熊段 +7.8% / 选择性出手 +7.3%</span>`
             : '尚未生成。';
-        // Jev
-        document.getElementById('jevPUp').textContent = _pct(j.p_up);
-        document.getElementById('jevPUp').style.color = _dirColor(j.direction);
-        document.getElementById('jevTarget').textContent = td !== '--' ? `· ${td}` : '';
-        document.getElementById('jevInfo').innerHTML = j.p_up !== undefined
-            ? `方向 <b>${_dir(j.direction)}</b><br><span style="font-size:11px;color:var(--text3)">置信 ${(j.confidence * 100).toFixed(0)}%（选择置信）</span>` : '未生成';
         // DeepSeek
         document.getElementById('dsPUp').textContent = _pct(ds.p_up);
         document.getElementById('dsPUp').style.color = _dirColor(ds.direction);
@@ -4687,7 +4659,7 @@
         }
     }
 
-    /* ═══ Jev 易术预判 ═══ */
+    /* ═══ AI预判小组件 ═══ */
     function _jevChip(text, good) {
         return `<span class="fund-flow-chip ${good ? 'good' : ''}">${text}</span>`;
     }

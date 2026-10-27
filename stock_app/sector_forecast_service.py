@@ -1,8 +1,7 @@
 # -*- coding: utf-8 -*-
-"""板块预测服务：每日 08:00 自动生成板块 Top10（GBM 主视角 + Jev 语义化次要视角）。
+"""板块预测服务：每日 08:00 自动生成板块 Top10（GBM 主视角）。
 
 GBM 主视角：板块 6 维特征（涨跌/动量/量能/宽度/大盘方向/资金流）每日全历史重训。
-Jev 语义化次要视角：板块行级语义标注（强流入/放量/宽/大盘向好）+ 类型化问题。
 数据层：复用 jev 缓存（sector_index_daily.parquet 与指数/市场同源），与每日定时管线共享生命周期。
 """
 from __future__ import annotations
@@ -141,30 +140,6 @@ def _enrich(df):
     return df
 
 
-def _semantic_sector(grp, idx_chg: float):
-    import pandas as pd
-    out = grp.copy()
-    out["资金语义"] = pd.cut(out["main_force_net"].fillna(0),
-                           bins=[-1e20, -1e8, 1e8, 1e20],
-                           labels=["净流出", "弱流入", "强流入"])
-    out["连续语义"] = out["flow_streak"].fillna(0).apply(
-        lambda x: f"连续{x:+.0f}天流入" if x > 0 else (f"连续{abs(x):+.0f}天流出" if x < 0 else "无连续")
-    )
-    out["涨跌语义"] = pd.cut(out["chg"].fillna(0),
-                           bins=[-100, -1, 1, 100],
-                           labels=["弱", "中", "强"])
-    out["量能语义"] = pd.cut(out["amt_5v20"].fillna(1),
-                           bins=[0, 0.9, 1.1, 99],
-                           labels=["缩量", "中", "放量"])
-    out["宽度语义"] = pd.cut(out["sector_breadth"].fillna(0.5),
-                           bins=[0, 0.42, 0.58, 1],
-                           labels=["窄", "中", "宽"])
-    out["大盘语义"] = "向好" if idx_chg > 0 else "向差"
-    return out
-
-
-FEATS = ["chg", "chg_5d", "amt_5v20", "idx_up", "sector_breadth", "main_force_net", "flow_streak"]
-
 
 def _flow_streak(series):
     """连续正/负资金流天数（v18 验证对 LLM 有增益的维度）。"""
@@ -172,6 +147,9 @@ def _flow_streak(series):
     blocks = (s.diff().fillna(0) != 0).cumsum()
     run = s.groupby(blocks).cumsum()
     return run * np.sign(series)
+
+
+FEATS = ["chg", "chg_5d", "amt_5v20", "idx_up", "sector_breadth", "main_force_net", "flow_streak"]
 
 
 def run_sector_forecast(top_n: int = 10, trigger: str = "manual") -> Dict:
@@ -210,56 +188,16 @@ def run_sector_forecast(top_n: int = 10, trigger: str = "manual") -> Dict:
                 for _, r in gbm_top.iterrows()
             ]
 
-            _set_task(progress=75, message="Jev 语义化板块次要视角")
-            from .jev_service import (_load_index_closes, _systemone_ask, _clamp01,
-                                      yiji_context)
-            from .jev_service import _load_index_closes as _lic
-            idx_rows = _lic(force=True)
-            closes = [c for _, c in idx_rows]
-            days_idx = [d for _, in idx_rows] if False else [d for d, _ in idx_rows]
-            idx_chg = 0.0
-            if latest in days_idx:
-                i = days_idx.index(latest)
-                if i > 0:
-                    idx_chg = (closes[i] / closes[i - 1] - 1) * 100
-            sem = _semantic_sector(grp_today.nlargest(12, "main_force_net"), idx_chg)
-            yiji = yiji_context(_date.fromisoformat(latest[:4] + "-" + latest[4:6] + "-" + latest[6:]))
-            sectors = sem["name"].tolist()
-            ctx = sem[["name", "chg", "chg_5d", "amt_5v20", "sector_breadth", "flow_streak",
-                       "资金语义", "连续语义", "涨跌语义", "量能语义", "宽度语义", "大盘语义"]].to_dict("records")
-            jev_picks = []
-            try:
-                questions = {}
-                for s in sectors:
-                    questions[f"up::{s}"] = {"type": "choice",
-                                              "question": f"Will sector {s} CLOSE UP tomorrow? (semantic hints)",
-                                              "criteria": {"up": "up", "down": "down"}}
-                answers = _systemone_ask(
-                    {"sectors_semantic": ctx, "yiji": yiji, "target_date": latest}, questions)
-                if answers:
-                    scored = []
-                    for s in sectors:
-                        a = answers.get(f"up::{s}")
-                        if a:
-                            probs = a.get("probabilities") or {}
-                            p = _clamp01(probs.get("up", 0.0))
-                            if a.get("choice") == "up" or p >= 0.5:
-                                scored.append({"sector": s, "p_up": round(p, 4)})
-                    jev_picks = sorted(scored, key=lambda x: -x["p_up"])[:top_n]
-            except Exception as exc:
-                _log().warning(f"Jev 板块次要视角失败: {exc}")
-
             _set_task(progress=95, message="落盘")
             out = {
                 "generated_at": datetime.now().isoformat(timespec="seconds"),
                 "target_date": latest,
                 "gbm_picks": gbm_picks,
-                "jev_picks": jev_picks,
             }
             FORECAST_DIR.mkdir(parents=True, exist_ok=True)
             SECTOR_PATH.write_text(json.dumps(out, ensure_ascii=False, indent=1), encoding="utf-8")
             _set_task(state="completed", progress=100,
-                      message=f"板块预测完成: {latest} GBM Top{top_n} / Jev {len(jev_picks)} 个",
+                      message=f"板块预测完成: {latest} GBM Top{top_n}",
                       finished_at=datetime.now().isoformat(timespec="seconds"))
         except BaseException as exc:
             _set_task(state="failed", message=f"板块预测失败: {type(exc).__name__}",

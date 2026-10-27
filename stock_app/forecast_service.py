@@ -226,7 +226,7 @@ def _vec_from_v5(f: Dict, closes, i: int) -> list:
     ]
 
 
-# ── LLM 次要视角（Jev-v13 语义化 + DeepSeek）─────────────────────────────
+# ── DeepSeek 次要视角 ─────────────────────────────────────────────────────
 def _semanticize(feats: Dict) -> Dict:
     out = dict(feats)
     def tag(key, lo, hi, labels):
@@ -242,35 +242,6 @@ def _semanticize(feats: Dict) -> Dict:
     tag("隔夜缺口%", -0.2, 0.2, ("低开", "高开"))
     tag("VIX", 16, 24, ("低恐慌", "高恐慌"))
     return out
-
-
-def _jev_signal(target: _date) -> Optional[Dict]:
-    """Jev-v13 语义化次要视角（TypeSafe systemone）。target=最近已完成交易日（与GBM一致）。"""
-    try:
-        from .jev_service import _market_features_v10, _systemone_ask, _clamp01, yiji_context
-        # target 即 as_of（最近已完成交易日收盘），用 ≤target-1 的特征
-        as_of = target - timedelta(days=1)
-        feats = _market_features_v10(as_of)
-        if not feats:
-            return None
-        sem = _semanticize(feats)
-        yiji = yiji_context(target)
-        answers = _systemone_ask(
-            {"market": sem, "yiji": yiji, "target_date": target.isoformat()},
-            {"up_tomorrow": {
-                "type": "choice",
-                "question": f"综合数据（含语义标注）与易术，判断上证指数 {target.isoformat()} 收盘上涨还是下跌？",
-                "criteria": {"UP": "上涨", "DOWN": "下跌"},
-            }})
-        if not answers or "up_tomorrow" not in answers:
-            return None
-        a = answers["up_tomorrow"]
-        probs = a.get("probabilities") or {}
-        return {"p_up": _clamp01(probs.get("UP", 0.5)), "direction": a.get("choice"),
-                "confidence": a.get("confidence"), "provider": "jev-latest"}
-    except Exception as exc:
-        _log().warning(f"Jev 次要视角失败: {exc}")
-        return None
 
 
 def _deepseek_signal(target: _date) -> Optional[Dict]:
@@ -352,8 +323,7 @@ def run_daily(force: bool = False, trigger: str = "manual") -> Dict:
             if not gbm:
                 raise RuntimeError("GBM 信号生成失败（数据不足）")
 
-            _set_task(progress=60, message="LLM 次要视角")
-            jev = _jev_signal(target_day)
+            _set_task(progress=60, message="DeepSeek 次要视角")
             deepseek = _deepseek_signal(target_day)
 
             _set_task(progress=90, message="落盘")
@@ -362,7 +332,7 @@ def run_daily(force: bool = False, trigger: str = "manual") -> Dict:
                 "target_date": target_day.isoformat(),
                 "as_of": as_of.isoformat(),
                 "gbm": gbm,
-                "jev": jev, "deepseek": deepseek,
+                "deepseek": deepseek,
             }
             FORECAST_DIR.mkdir(parents=True, exist_ok=True)
             LATEST_PATH.write_text(json.dumps(out, ensure_ascii=False, indent=1), encoding="utf-8")
