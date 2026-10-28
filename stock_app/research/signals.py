@@ -200,6 +200,25 @@ def get_watch_pool_codes(days: int = 90) -> set:
     return codes
 
 
+def _bounded(fn, seconds: float):
+    """线程硬超时执行——requests/socket 层超时在 Windows+代理组合下可能失效，
+    卡死的 connect 用线程 join 兜底。超时返回 None。"""
+    import threading as _threading
+
+    box: dict = {}
+
+    def _run():
+        try:
+            box["r"] = fn()
+        except Exception:
+            box["r"] = None
+
+    th = _threading.Thread(target=_run, daemon=True)
+    th.start()
+    th.join(seconds)
+    return box.get("r")
+
+
 def refresh_calendar_events(ahead_days: int = 45) -> int:
     """用 Tushare 披露日历填充未来事件（财报披露日）。
 
@@ -227,14 +246,22 @@ def refresh_calendar_events(ahead_days: int = 45) -> int:
     rows = []
     batch = 80
     pro = create_tushare_pro(timeout=30)
+    fail_streak = 0
+    import logging as _logging
+
+    _log = _logging.getLogger(__name__)
     for i in range(0, len(ts_codes), batch):
         part = ts_codes[i:i + batch]
-        try:
-            df = pro.disclosure_date(ts_code=",".join(part))
-        except Exception:
+        # 线程硬超时60s; 连续3批失败即放弃剩余批次(源挂死时不无限等)
+        df = _bounded(lambda pp=part: pro.disclosure_date(ts_code=",".join(pp)), 60.0)
+        if df is None or getattr(df, "empty", True):
+            fail_streak += 1
+            _log.warning("披露日历批次 %d 拉取失败(连续第%d次)", i // batch, fail_streak)
+            if fail_streak >= 3:
+                _log.warning("披露日历连续3批失败, 放弃剩余批次")
+                break
             continue
-        if df is None or df.empty:
-            continue
+        fail_streak = 0
         df = df[df["end_date"].isin(recent_periods)]
         for _, r in df.iterrows():
             pre = str(r.get("pre_date") or "")[:8]
