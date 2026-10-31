@@ -4442,6 +4442,19 @@ def forecast_status_api(request):
         return JsonResponse({'status': 'error', 'message': str(e)}, status=400)
 
 
+def direction_compass_api(request):
+    """多空合议信号：GBM+同状态概率+周期+DeepSeek 合成一个读数。"""
+    try:
+        from .direction_compass_service import compute_compass
+        result = compute_compass()
+        if result is None:
+            return JsonResponse({'status': 'error', 'message': 'GBM信号尚未生成'}, status=400)
+        return JsonResponse({'status': 'success', **_make_json_serializable(result)})
+    except Exception as e:
+        logger.error(f"多空合议失败: {e}\n{traceback.format_exc()}")
+        return JsonResponse({'status': 'error', 'message': str(e)}, status=400)
+
+
 def market_regime_api(request):
     """同状态历史概率表：当前市场状态 × 全历史同状态后续收益分布。"""
     try:

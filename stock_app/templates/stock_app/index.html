@@ -2368,6 +2368,20 @@
     </div>
 
     <!-- ═══ V29 止损巡检面板 ═══ -->
+    <!-- 多空合议仪表盘 -->
+    <div class="fund-flow-panel show" id="compassCard">
+        <div class="fund-flow-hdr">
+            <div>
+                <div class="fund-flow-title"><i class="fas fa-compass"></i> 多空合议信号</div>
+                <div class="fund-flow-sub">GBM主信号(40%) + 同状态概率(30%) + 周期位置(15%) + DeepSeek(15%) —— 一个读数，分歧自动降置信。</div>
+            </div>
+            <button class="btn-train" onclick="loadCompass()" style="padding:8px 12px"><i class="fas fa-sync-alt"></i> 刷新</button>
+        </div>
+        <div style="padding:16px 20px 20px">
+            <div id="compassBody" style="font-size:14px;color:var(--text2)">加载中…</div>
+        </div>
+    </div>
+
     <div class="fund-flow-panel" id="jevPanel">
         <div class="fund-flow-hero">
             <div>
@@ -2679,7 +2693,7 @@
         fundFlow: ['fundFlowPanel'],
         research: ['researchPanel'],
         global: ['globalRadarPanel'],
-        jev: ['jevPanel', 'stateProbCard'],
+        jev: ['jevPanel', 'stateProbCard', 'compassCard'],
         exit: ['exitPanel'],
     };
     function _setElVisible(id, visible) {
@@ -2710,6 +2724,7 @@
         if (page === 'ai' && typeof loadScorecard === 'function') loadScorecard();
         if (page === 'exit' && typeof loadPortfolioSignals === 'function') loadPortfolioSignals();
         if (page === 'jev' && typeof loadStateProb === 'function') loadStateProb();
+        if (page === 'jev' && typeof loadCompass === 'function') loadCompass();
         [
             ['Ai', 'ai'],
             ['Strategy', 'strategy'],
@@ -6459,6 +6474,53 @@
             wait.textContent = '❌ ' + (e.message || '网络失败');
         }
         _qaBusy = false;
+    }
+
+    /* ── 多空合议仪表盘 ── */
+    async function loadCompass() {
+        const el = document.getElementById('compassBody');
+        try {
+            const res = await fetch(`${API_BASE}/direction-compass/`, {cache: 'no-store'});
+            const d = await res.json();
+            if (d.status !== 'success') throw new Error(d.message || '读取失败');
+            const label = d['标签'] || '中性';
+            const labelColor = label === '偏多' ? 'var(--green,#00d68f)' : label === '偏空' ? 'var(--red)' : 'var(--gold)';
+            const arrow = label === '偏多' ? '📈' : label === '偏空' ? '📉' : '⚖️';
+            const conf = d['置信'] || '-';
+            const parts = d['分项'] || {};
+            const row = (name, obj) => {
+                const p = obj['p_up'];
+                const pTxt = p != null ? (p <= 1 ? (p * 100).toFixed(0) + '%' : p.toFixed(0)) : '-';
+                const extra = name === 'GBM主信号' ? (obj['选择性出手'] ? '· 选择性出手✓(全权计票)' : '· 未过门槛(半权中性)') :
+                              name === '周期位置' ? `· 温度${obj['温度']} ${obj['阶段'] || ''}` :
+                              name === '同状态概率20日' ? '· 历史同状态20日上涨概率' : '· 次要参考';
+                return `<tr><td style="padding:7px 6px">${name}</td>
+                    <td style="padding:7px 6px;font-weight:700">${pTxt}</td>
+                    <td style="padding:7px 6px">权重 ${(obj['权重'] * 100).toFixed(0)}%</td>
+                    <td style="padding:7px 6px;color:var(--text2);font-size:12px">${extra}</td></tr>`;
+            };
+            el.innerHTML = `
+                <div style="display:flex;align-items:center;gap:22px;flex-wrap:wrap">
+                    <div style="text-align:center;min-width:150px">
+                        <div style="font-size:44px;font-weight:900;color:${labelColor};line-height:1.1">${arrow} ${label}</div>
+                        <div style="font-family:var(--mono);font-size:13px;color:var(--text2);margin-top:4px">多空分 <b style="color:var(--text1)">${d['多空分']}</b>/100 · 数据日 ${d['数据日']}</div>
+                        <div style="font-size:12px;margin-top:2px">置信档: <b style="color:var(--teal)">${conf}</b></div>
+                    </div>
+                    <div style="flex:1;min-width:280px">
+                        <table style="width:100%;border-collapse:collapse;font-size:13px;color:var(--text1)">
+                            <tr style="color:var(--text2)"><th style="text-align:left;padding:6px">分项</th><th style="text-align:left">看多概率</th><th style="text-align:left">权重</th><th style="text-align:left">说明</th></tr>
+                            ${row('GBM主信号', parts['GBM主信号'] || {})}
+                            ${row('同状态概率20日', parts['同状态概率20日'] || {})}
+                            ${row('周期位置', parts['周期位置'] || {})}
+                            ${row('DeepSeek', parts['DeepSeek'] || {})}
+                        </table>
+                    </div>
+                </div>
+                ${(d['分歧项'] || []).length ? `<div style="margin-top:10px;font-size:13px;color:var(--gold)">⚠️ 分歧项: ${d['分歧项'].join('、')} —— 分项观点不一致，置信已降档，此时轻仓/等待比跟信号重要</div>` : ''}
+                <div style="margin-top:8px;font-size:12px;color:var(--text2)">📖 ${d['合议说明'] || ''}</div>`;
+        } catch (e) {
+            el.innerHTML = `<span style="color:var(--red)">加载失败: ${e.message}</span>`;
+        }
     }
 
     /* ── 同状态历史概率表 ── */

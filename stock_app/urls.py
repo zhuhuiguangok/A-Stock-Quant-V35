@@ -17,6 +17,7 @@ urlpatterns = [
     path('api/portfolio/signals/', views.portfolio_signals_api, name='portfolio_signals'),
     path('api/stock-qa/', views.stock_qa_api, name='stock_qa'),
     path('api/market-regime/', views.market_regime_api, name='market_regime'),
+    path('api/direction-compass/', views.direction_compass_api, name='direction_compass'),
     path('api/portfolio/account/', views.portfolio_account_api, name='portfolio_account'),
     path('api/portfolio/holdings/', views.portfolio_holdings_api, name='portfolio_holdings'),
     path('api/portfolio/holdings/add/', views.portfolio_add_holding_api, name='portfolio_add_holding'),
