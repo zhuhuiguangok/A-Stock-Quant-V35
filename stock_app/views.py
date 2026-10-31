@@ -4442,6 +4442,19 @@ def forecast_status_api(request):
         return JsonResponse({'status': 'error', 'message': str(e)}, status=400)
 
 
+def market_regime_api(request):
+    """同状态历史概率表：当前市场状态 × 全历史同状态后续收益分布。"""
+    try:
+        from .market_regime_service import compute_state_probability
+        result = compute_state_probability()
+        if result is None:
+            return JsonResponse({'status': 'error', 'message': '指数数据不足'}, status=400)
+        return JsonResponse({'status': 'success', **_make_json_serializable(result)})
+    except Exception as e:
+        logger.error(f"市场状态概率表失败: {e}\n{traceback.format_exc()}")
+        return JsonResponse({'status': 'error', 'message': str(e)}, status=400)
+
+
 @csrf_exempt
 def model_retrain_run_api(request):
     """Manually trigger a full model retrain from local cached data."""

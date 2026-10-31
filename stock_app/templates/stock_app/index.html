@@ -2430,6 +2430,20 @@
         </div>
     </div>
 
+    <!-- 同状态历史概率表 -->
+    <div class="fund-flow-panel show" id="stateProbCard">
+        <div class="fund-flow-hdr">
+            <div>
+                <div class="fund-flow-title"><i class="fas fa-scale-balanced"></i> 同状态概率表 · 历史接下来会怎样</div>
+                <div class="fund-flow-sub">不预测方向：把当前市场状态映射到全历史同状态交易日，展示其后的真实收益分布。样本不足的状态不给出统计。</div>
+            </div>
+            <button class="btn-train" onclick="loadStateProb()" style="padding:8px 12px"><i class="fas fa-sync-alt"></i> 刷新</button>
+        </div>
+        <div style="padding:14px 20px 20px">
+            <div id="stateProbBody" style="font-size:14px;color:var(--text2)">加载中…</div>
+        </div>
+    </div>
+
     <div class="exit-panel" id="exitPanel">
         <div class="exit-panel-hdr">
             <div>
@@ -2665,7 +2679,7 @@
         fundFlow: ['fundFlowPanel'],
         research: ['researchPanel'],
         global: ['globalRadarPanel'],
-        jev: ['jevPanel'],
+        jev: ['jevPanel', 'stateProbCard'],
         exit: ['exitPanel'],
     };
     function _setElVisible(id, visible) {
@@ -2695,6 +2709,7 @@
         Object.entries(PAGE_GROUPS).forEach(([key, ids]) => ids.forEach(id => _setElVisible(id, key === page)));
         if (page === 'ai' && typeof loadScorecard === 'function') loadScorecard();
         if (page === 'exit' && typeof loadPortfolioSignals === 'function') loadPortfolioSignals();
+        if (page === 'jev' && typeof loadStateProb === 'function') loadStateProb();
         [
             ['Ai', 'ai'],
             ['Strategy', 'strategy'],
@@ -6445,6 +6460,79 @@
         }
         _qaBusy = false;
     }
+
+    /* ── 同状态历史概率表 ── */
+    async function loadStateProb() {
+        const el = document.getElementById('stateProbBody');
+        try {
+            const res = await fetch(`${API_BASE}/market-regime/`, {cache: 'no-store'});
+            const d = await res.json();
+            if (d.status !== 'success') throw new Error(d.message || '读取失败');
+            const cur = d['当前状态'] || {}, cs = d['当前统计'] || {};
+            const insufficient = !!cs['不足'];
+            const hRow = (label, obj) => !obj ? '' : `
+                <tr><td style="padding:7px 6px"><b>${label}</b></td>
+                    <td style="padding:7px 6px;color:${(obj['均']||0)>=0?'var(--green,#00d68f)':'var(--red)'}">${obj['均'] > 0 ? '+' : ''}${obj['均']}%</td>
+                    <td style="padding:7px 6px">${obj['中位'] > 0 ? '+' : ''}${obj['中位']}%</td>
+                    <td style="padding:7px 6px;color:var(--text2)">${obj['P10']}% ~ ${obj['P90'] ? '+' + obj['P90'] : ''}%</td>
+                    <td style="padding:7px 6px;font-weight:700">${obj['上涨概率']}%</td></tr>`;
+            const meta = `
+                <div style="background:var(--bg3);border:1px solid var(--border);border-radius:10px;padding:12px 14px;margin-bottom:12px;font-size:14px">
+                    <b>当前状态</b>（${d['数据日']}）：<b style="color:var(--gold)">${cur['回撤档']}</b>（距250日高点 ${cur['距250日高点%']}%）×
+                    <b style="color:var(--gold)">${cur['动量档']}</b>（20日 ${cur['20日涨跌%']}%）·
+                    收盘 ${cur['收盘']} 位于 MA20(${cur['MA20']})/MA60(${cur['MA60']})/MA250(${cur['MA250']}) 下方
+                </div>`;
+            if (insufficient) {
+                el.innerHTML = meta + `<div style="color:var(--text2)">当前状态历史样本不足（${cs['样本']}次），不给统计——诚实比硬猜强。</div>`;
+                return;
+            }
+            const recents = (d['最近同状态'] || []).filter(x => x['20日实际'] !== null).slice(-5).reverse();
+            const recentHtml = recents.length ? `
+                <div style="margin-top:10px;font-size:13px;color:var(--text2)">最近同状态实例（20日后实际）：
+                    ${recents.map(x => `<span style="margin-right:10px;color:${x['20日实际'] >= 0 ? 'var(--green,#00d68f)' : 'var(--red)'}">${x['day']} <b>${x['20日实际'] > 0 ? '+' : ''}${x['20日实际']}%</b></span>`).join('')}
+                </div>` : '';
+            const rows = (d['全表'] || []).map(r => `
+                <tr style="border-top:1px solid var(--border);${r['是当前'] ? 'background:rgba(0,212,170,.08)' : ''}">
+                    <td style="padding:7px 6px">${r['回撤档']}</td>
+                    <td style="padding:7px 6px">${r['动量档']}</td>
+                    <td style="padding:7px 6px">${r['样本']}</td>
+                    <td style="padding:7px 6px">${r['20日'] ? (r['20日']['均'] > 0 ? '+' : '') + r['20日']['均'] + '%' : '-'}</td>
+                    <td style="padding:7px 6px">${r['60日'] ? (r['60日']['均'] > 0 ? '+' : '') + r['60日']['均'] + '%' : '-'}</td>
+                    <td style="padding:7px 6px">${r['是当前'] ? '⬅ 当前' : ''}</td>
+                </tr>`).join('');
+            el.innerHTML = meta + `
+                <div style="background:var(--bg3);border:1px solid var(--border);border-radius:10px;padding:14px">
+                    <div style="font-size:15px;margin-bottom:10px">历史上 <b style="color:var(--gold)">${cs['样本']} 次</b>同样状态，之后——</div>
+                    <div style="display:flex;gap:24px;flex-wrap:wrap;margin-bottom:8px">
+                        <div>5日后反弹概率 <b style="color:var(--teal);font-size:18px">${cs['5日反弹概率']}%</b></div>
+                        <div>20日后更高概率 <b style="color:var(--teal);font-size:18px">${(cs['20日'] || {})['上涨概率']}%</b></div>
+                        <div>20日后继续跌超5% <b style="color:var(--red);font-size:18px">${cs['续跌超5%概率20日'] ?? '-'}%</b></div>
+                    </div>
+                    <table style="width:100%;border-collapse:collapse;font-size:13px;color:var(--text1)">
+                        <tr style="color:var(--text2)"><th style="text-align:left;padding:6px">窗口</th><th style="text-align:left">均收益</th><th style="text-align:left">中位数</th><th style="text-align:left">P10~P90</th><th style="text-align:left">上涨概率</th></tr>
+                        ${hRow('T+5', cs['5日'])}
+                        ${hRow('T+20', cs['20日'])}
+                        ${hRow('T+60', cs['60日'])}
+                    </table>
+                    ${recentHtml}
+                </div>
+                <div style="margin-top:10px">
+                    <div style="font-size:13px;color:var(--text2);margin-bottom:4px">📊 全部状态分布（高亮为当前状态）：</div>
+                    <table style="width:100%;border-collapse:collapse;font-size:12px;color:var(--text1)">
+                        <tr style="color:var(--text2)"><th style="text-align:left;padding:5px">回撤档</th><th style="text-align:left">动量档</th><th style="text-align:left">样本</th><th style="text-align:left">20日均</th><th style="text-align:left">60日均</th><th></th></tr>
+                        ${rows}
+                    </table>
+                </div>
+                <div style="margin-top:10px;font-size:12px;color:var(--text2)">
+                    📖 科普：这是<b>统计</b>不是预测——它回答"历史上跌到这个程度后，接下来通常怎样"。
+                    深跌后的统计偏暖（继续大跌属小概率）但<b>中位数涨幅也有限</b>，磨底期纪律比预测重要。
+                    警惕表里"中回撤+强势"这类状态：历史上追这种反弹最吃亏。
+                </div>`;
+        } catch (e) {
+            el.innerHTML = `<span style="color:var(--red)">加载失败: ${e.message}</span>`;
+        }
+    }
+
     </script>
 </body>
 </html>
