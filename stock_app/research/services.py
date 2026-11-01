@@ -51,6 +51,25 @@ def _resolve_stock_code(report: ResearchReport) -> tuple:
     return None, None
 
 
+def _bounded(fn, seconds: float):
+    """线程硬超时执行——Windows+代理组合下 socket 层超时可能失效，
+    爬虫 connect 挂死时用线程 join 兜底。超时返回 None。"""
+    import threading as _threading
+
+    box: dict = {}
+
+    def _run():
+        try:
+            box["r"] = fn()
+        except Exception:
+            box["r"] = None
+
+    th = _threading.Thread(target=_run, daemon=True)
+    th.start()
+    th.join(seconds)
+    return box.get("r")
+
+
 def crawl_all(progress=None, detail_budget: int = 20) -> Dict[str, dict]:
     """抓取全部注册源并入库（按 source+external_id 唯一约束去重）。
 
@@ -67,7 +86,12 @@ def crawl_all(progress=None, detail_budget: int = 20) -> Dict[str, dict]:
                 code=code,
                 defaults={"name": code, "base_url": crawler.base_url, "status": "active", "weight": 1.0},
             )
-            raw_reports = crawler.fetch_list(page=1)
+            raw_reports = _bounded(lambda: crawler.fetch_list(page=1), 90.0)
+            if raw_reports is None:
+                results[code] = {"saved": 0, "error": "列表抓取超时(90s)，跳过该源"}
+                if progress:
+                    progress(f"抓取 {code} 超时跳过")
+                continue
             saved = 0
             existing_ids = set(
                 ResearchReport.objects.filter(source=source).values_list("external_id", flat=True)
@@ -80,6 +104,7 @@ def crawl_all(progress=None, detail_budget: int = 20) -> Dict[str, dict]:
             new_rows = []
             detail_used = 0
             empty_streak = 0
+            conn_fail = 0
             for raw in raw_reports:
                 if raw["external_id"] in existing_ids:
                     continue
@@ -92,7 +117,15 @@ def crawl_all(progress=None, detail_budget: int = 20) -> Dict[str, dict]:
                 if not content_text and detail_used < detail_budget and empty_streak < 3:
                     detail_used += 1
                     try:
-                        detail = crawler.fetch_detail(raw["source_url"])
+                        # 连接超时用短窗(20s足够；正常详情页1-3s)，
+                        # 连接类失败与内容类失败分开计数：连接挂死的源
+                        # 会"超时/空内容交替"，若共用计数器熔断永远不触发
+                        detail = _bounded(lambda u=raw["source_url"]: crawler.fetch_detail(u), 20.0)
+                        if detail is None:
+                            conn_fail += 1
+                            if conn_fail >= 3:
+                                detail_used = detail_budget  # 耗尽名额：该源连接挂死，后续详情直接跳过
+                            continue
                         detail_text = detail.get("content_text") or ""
                         pdf_url = pdf_url or detail.get("pdf_url")
                         if detail_text:
