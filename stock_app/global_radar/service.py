@@ -169,7 +169,7 @@ def generate_ai_brief(payload: Optional[Dict] = None) -> Dict:
     except Exception:
         pass
 
-    prompt = f"""你是一名全球宏观策略分析师，每天为不懂金融的 A 股投资者写晨报（受众是普通人，要讲大白话）。以下是今日全球市场数据与信号事实：
+    prompt = f"""你是一名全球宏观策略分析师，每天为不懂金融的 A 股投资者写晨报（受众是普通人，要讲大白话）。铁律：只允许使用下方 facts 中出现的数据与数字，facts 里没有的数字、事件、涨跌幅一律不得写进晨报；宁可用"数据未覆盖"也不要编。以下是今日全球市场数据与信号事实：
 
 {facts}
 

@@ -63,7 +63,7 @@ class AIService:
         return self._call_moonshot(prompt)
 
     def _build_prompt(self, title: str, content: str) -> str:
-        return f"""你是一名资深 A 股投资分析师。请阅读以下券商研报，输出结构化 JSON：
+        return f"""你是一名资深 A 股投资分析师。请阅读以下券商研报，输出结构化 JSON。只基于提供的正文：正文未提及的公司、数字、事件不得出现在任何字段中：
 
 {{
   "summary": "300 字左右的投资逻辑摘要",

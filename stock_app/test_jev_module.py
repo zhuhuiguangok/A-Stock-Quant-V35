@@ -51,3 +51,30 @@ class ParseAndMetricsTest(SimpleTestCase):
         self.assertEqual(js._clamp01(1.7), 1.0)
         self.assertEqual(js._clamp01(-3), 0.0)
         self.assertEqual(js._clamp01("bad"), 0.5)
+
+
+class NumberProvenanceTest(SimpleTestCase):
+    """问一问数字溯源校验（反金融幻觉的确定性防线）。"""
+
+    def test_traced_numbers_pass(self):
+        from stock_app.stock_qa_service import _unverifiable_numbers
+
+        ctx = "现价 67.5，MA20=77.8，20日涨跌% -24.9，研报覆盖 1 篇"
+        ans = "现价 67.5，20日跌了近 25%，MA20 在 77.8。"
+        self.assertEqual(_unverifiable_numbers(ans, ctx), [])
+
+    def test_fabricated_precision_flagged(self):
+        from stock_app.stock_qa_service import _unverifiable_numbers
+
+        ctx = "现价 67.5，20日涨跌% -24.9"
+        ans = "市盈率 15.32 倍，目标价 82.46，主力流入 3.25 亿。"
+        flagged = _unverifiable_numbers(ans, ctx)
+        self.assertTrue(any("15.32" in f for f in flagged), flagged)
+        self.assertTrue(any("82.46" in f for f in flagged), flagged)
+
+    def test_years_exempt(self):
+        from stock_app.stock_qa_service import _unverifiable_numbers
+
+        ctx = "数据日 20261030"
+        ans = "2026 年以来跌了不少，2024 年也跌过。"
+        self.assertEqual(_unverifiable_numbers(ans, ctx), [])

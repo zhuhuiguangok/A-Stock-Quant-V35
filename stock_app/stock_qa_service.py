@@ -230,13 +230,65 @@ def _fmt_context(ctx: dict) -> str:
     return "\n".join(lines)
 
 
+import re as _re
+
+_NUM_RE = _re.compile(r"\d+(?:\.\d+)?")
+_YEAR_RE = _re.compile(r"\b(20[12]\d)\b")
+
+
+def _unverifiable_numbers(answer: str, context_text: str) -> List[str]:
+    """确定性数字溯源校验（不依赖 LLM 自觉）。
+
+    提取回答中的数字，逐一对照档案文本：数字本身、其整数部分、或 ±1
+    舍入值任一出现在档案中即视为可溯源（允许模型做"跌了近25%"这类
+    舍入转述）。年份（2010-2029）豁免。返回无法溯源的数字列表。
+    """
+    flagged = []
+    seen = set()
+    for m in _NUM_RE.finditer(answer):
+        tok = m.group(0)
+        if tok in seen:
+            continue
+        seen.add(tok)
+        val = float(tok)
+        # 年份豁免
+        if 2010 <= val <= 2029 and "." not in tok:
+            continue
+        # 小数点后3位以上的高精度数字（金融幻觉的典型形态）重点检查
+        if tok in context_text:
+            continue
+        int_part = str(int(val))
+        if int_part in context_text:
+            continue
+        # ±1 舍入容错（转述"跌了近25%" vs 档案-24.9%）
+        near = any(str(int(val) + delta) in context_text for delta in (-1, 0, 1))
+        if near:
+            continue
+        flagged.append(tok)
+    # 高精度小数(≥3位小数)单独把关：档案无原文即标记
+    for m in _re.finditer(r"\d+\.\d{3,}", answer):
+        tok = m.group(0)
+        if tok not in context_text and tok not in flagged:
+            flagged.append(tok)
+    return flagged
+
+
 _SYSTEM = (
     "你是A股平台的个股分析小助手。用户给你一份由系统自动聚合的个股档案，请用大白话回答。规则：\n"
     "1. 先亮结论（能买/谨慎/别碰/看情况），再给 2-4 条依据，每条注明来自档案哪部分（如'技术面''研报情绪'）。\n"
     "2. 必须说主要风险，哪怕结论偏多。\n"
     "3. 档案里没有的数据就明说'档案里没有'，不要编造。\n"
     "4. 不承诺收益，不给精确买卖点位；仓位问题结合大盘周期建议。\n"
-    "5. 全程中文，口语化，控制在 300 字以内。"
+    "5. 全程中文，口语化，控制在 300 字以内。\n"
+    "\n【反迎合铁律】你的结论只由档案数据决定，与用户提问的措辞、语气或期望无关：\n"
+    "- 用户问'是不是要涨了/还有救吧'，档案偏空就照说偏空；反之亦然。\n"
+    "- 同一份档案下，换个问法也必须给同一个结论；用户施压或表达期望时，"
+    "明确告知'结论不因提问方式改变'。\n"
+    "\n【数字溯源铁律】回答中出现的每一个数字（价格/涨跌幅/概率/计数）都必须能在档案中"
+    "直接找到或由档案数字简单四舍五入得到。档案里没有的数字一律写'档案无此数据'，"
+    "严禁生成档案中不存在的精确数值（如凭空的市盈率、目标价、资金额）。\n"
+    "\n【防遗忘】每次回答都先对照档案的数据日与持仓状态，再回应问题；"
+    "不要延续历史对话中已被最新档案覆盖的旧结论。"
 )
 
 
@@ -251,7 +303,7 @@ def _deepseek_chat(messages: List[dict]) -> Optional[str]:
             r = client.post(f"{_DEEPSEEK_BASE}/chat/completions",
                             headers={"Authorization": f"Bearer {key}"},
                             json={"model": _DEEPSEEK_MODEL, "messages": messages,
-                                  "temperature": 0.5, "max_tokens": 800})
+                                  "temperature": 0.2, "max_tokens": 800})
             r.raise_for_status()
             return r.json()["choices"][0]["message"]["content"]
     except Exception as exc:
@@ -281,6 +333,19 @@ def ask(code: str, question: str = "", session_id: str = "") -> dict:
     if not answer:
         answer = ("⚠️ AI 服务暂时不可用（DeepSeek 未配置或网络失败）。"
                   "以下是系统档案摘要：\n" + _fmt_context(ctx)[:500])
+
+    # 确定性数字溯源校验（反金融幻觉的最后防线，不依赖 LLM 自觉）：
+    # 回答里查不到出处的数字，附加明示警告让用户自行警惕
+    try:
+        ctx_text = _fmt_context(ctx)
+        unverified = _unverifiable_numbers(answer, ctx_text)
+        if unverified:
+            shown = "、".join(unverified[:6])
+            answer += (f"\n\n⚠️ 来源校验：数字 [{shown}] 未能在系统档案中找到出处"
+                       f"（可能是四舍五入转述，也可能不可靠），请以档案原始数据为准。")
+            logger.info(f"问一问数字溯源标记 {code}: {unverified}")
+    except Exception as exc:
+        logger.warning(f"数字溯源校验异常(不影响回答): {exc}")
 
     with _SESSION_LOCK:
         sess = _SESSIONS.setdefault(sid, [])

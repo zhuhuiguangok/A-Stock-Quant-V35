@@ -276,7 +276,8 @@ def _deepseek_signal(target: _date) -> Optional[Dict]:
         body = {
             "model": "deepseek-chat",
             "messages": [
-                {"role": "system", "content": "你是严谨的量化分析师，兼通易术象数。只输出合法 JSON，不要解释。"},
+                {"role": "system", "content": "你是严谨的量化分析师，兼通易术象数。只输出合法 JSON，不要解释。"
+                 "判断只能依据上方给出的市场数据与卦象；输入中不存在的信息不得出现在输出里。"},
                 {"role": "user", "content": prompt},
             ],
             "temperature": 0.2, "max_tokens": 900,
