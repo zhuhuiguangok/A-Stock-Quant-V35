@@ -54,4 +54,8 @@ def run_daily_pipeline(progress=None, summarize_limit: int = None) -> dict:
     _say("研报库备份保全")
     from .backup import _maybe_backup_db
     result["backup"] = _maybe_backup_db()
+
+    _say("清理过期研报")
+    from . import services as _services
+    result["cleanup"] = _services.cleanup_old_reports()
     return result

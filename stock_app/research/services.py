@@ -70,6 +70,51 @@ def _bounded(fn, seconds: float):
     return box.get("r")
 
 
+
+def cleanup_old_reports(days: int = None) -> dict:
+    """清理过期研报（默认保留 120 天，env RESEARCH_RETENTION_DAYS 可调）。
+
+    保护规则：挂有盈利预测(EarningsForecast)的研报不删——盈利一致预期
+    信号依赖多份历史预测取中位数。摘要/推荐随报告级联删除。
+    删除后 VACUUM 回收 sqlite 空间。
+    """
+    import os as _os
+    from datetime import date as _date, timedelta as _timedelta
+
+    from ..models import EarningsForecast, ResearchReport
+
+    if days is None:
+        try:
+            days = int(_os.environ.get("RESEARCH_RETENTION_DAYS", "120"))
+        except ValueError:
+            days = 120
+    cutoff = _date.today() - _timedelta(days=days)
+
+    old_qs = ResearchReport.objects.filter(report_date__lt=cutoff)
+    protected = set(EarningsForecast.objects.filter(
+        report__report_date__lt=cutoff).values_list("report_id", flat=True))
+    old_ids = list(old_qs.exclude(id__in=protected).values_list("id", flat=True))
+
+    deleted_reports, deleted_summary = 0, 0
+    if old_ids:
+        deleted_summary = sum(1 for r in ResearchReport.objects.filter(
+            id__in=old_ids, summary__isnull=False))
+        deleted_reports, _ = ResearchReport.objects.filter(id__in=old_ids).delete()
+
+    # VACUUM 回收空间（sqlite）
+    from django.db import connection
+
+    with connection.cursor() as cur:
+        cur.execute("VACUUM")
+
+    return {
+        "保留天数": days,
+        "截止日": str(cutoff),
+        "删除研报": deleted_reports,
+        "随删摘要": deleted_summary,
+        "保护(挂盈利预测)": len(protected),
+    }
+
 def crawl_all(progress=None, detail_budget: int = 20) -> Dict[str, dict]:
     """抓取全部注册源并入库（按 source+external_id 唯一约束去重）。
 
