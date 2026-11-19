@@ -146,4 +146,8 @@ def main(start_date: str = None) -> None:
 
 
 if __name__ == "__main__":
-    main(sys.argv[1] if len(sys.argv) > 1 else None)
+    import re
+    _raw = sys.argv[1] if len(sys.argv) > 1 else None
+    # 起始日期必须严格为 YYYYMMDD，否则忽略（防污点参数流入 API 查询）
+    start = _raw if _raw and re.fullmatch(r"\d{8}", _raw) else None
+    main(start)
