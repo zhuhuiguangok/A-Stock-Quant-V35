@@ -90,6 +90,30 @@ def main(start_after: str | None = None) -> None:
     base = start_after or latest
     print(f"[1/4] 现有池最新日期 {latest}，最新有效交易日 {end_date}", flush=True)
     topup_sector_index(pro, end_date)
+
+    # ── 全市场池日常维护（backfill_all_market 断点续传，只拉缺失日）──
+    try:
+        allmkt_files = glob.glob(str(CACHE_DIR / "real_data_allmkt_*.parquet"))
+        if allmkt_files:
+            last_am = "0"
+            for f in allmkt_files:
+                try:
+                    last_am = max(last_am, str(pd.read_parquet(f, columns=["trade_date"])["trade_date"].astype(str).max()))
+                except Exception:
+                    continue
+            from datetime import datetime as _dt
+            next_day = (_dt.strptime(last_am, "%Y%m%d") + timedelta(days=1)).strftime("%Y%m%d")
+            if next_day <= end_date:
+                print(f"[0/4] 全市场池增量: {next_day} → {end_date}", flush=True)
+                from backfill_all_market import main as _bfm
+                _bfm(next_day)
+            else:
+                print(f"✅ 全市场池已是最新 ({last_am})", flush=True)
+        else:
+            print("⚠️ 全市场池未建立（先跑 backfill_all_market.py 完整回补）", flush=True)
+    except Exception as exc:
+        print(f"⚠️ 全市场池维护失败(不影响csi1000): {exc}", flush=True)
+
     if base >= end_date:
         print("✅ 训练池已是最新，无需补齐", flush=True)
         return

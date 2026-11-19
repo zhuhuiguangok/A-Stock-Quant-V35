@@ -50,4 +50,8 @@ def run_daily_pipeline(progress=None, summarize_limit: int = None) -> dict:
 
     _say("回填 T+1/T+5/T+20 收益")
     result["returns"] = services.update_pick_returns()
+
+    _say("研报库备份保全")
+    from .backup import _maybe_backup_db
+    result["backup"] = _maybe_backup_db()
     return result
